@@ -1,0 +1,3646 @@
+library(tidyverse)
+library(readxl)
+library(randomForest)
+library(pROC)
+library(glmnet)
+library(e1071)
+library(caret)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+library(caret)
+library(VennDiagram)
+library(dplyr)
+library(writexl)
+
+
+#===============================================================ML for visits========================================================================
+
+#***************************
+#      LOAD DATA
+#***************************
+#*
+#Loading data and data clean up
+set.seed(12345)
+final_data_3 <- read_excel("Final_data_3.xlsx")
+
+# Update DT values
+final_data_3$DiseaseType[final_data_3$DiseaseType == "T-ALL"] <- 1
+final_data_3$DiseaseType[final_data_3$DiseaseType == "B-ALL"] <- 2
+final_data_3$DiseaseType <- as.numeric(as.character(final_data_3$DiseaseType))
+
+#Update Gender values
+final_data_3$Gender[final_data_3$Gender == "F"] <- 1
+final_data_3$Gender[final_data_3$Gender == "M"] <- 2
+final_data_3$Gender <- as.numeric(as.character(final_data_3$Gender))
+
+#Clean extra spaces and convert everything to real NA
+final_data_3$Group_CNS_Involvement <- trimws(as.character(final_data_3$Group_CNS_Involvement))
+#Treat "NA" text as real NA
+final_data_3$Group_CNS_Involvement[final_data_3$Group_CNS_Involvement == "NA"] <- NA
+#Delete all rows where this column is NA or empty
+final_data_ML <- final_data_3[!is.na(final_data_3$Group_CNS_Involvement) & 
+                                final_data_3$Group_CNS_Involvement != "", ]
+final_data_ML$Group_CNS_Involvement <-   as.numeric(as.character(unlist(final_data_ML$Group_CNS_Involvement)))
+print(final_data_ML)
+names(final_data_ML)[!sapply(final_data_ML, is.numeric)]
+
+cols_to_fix <- c("DiseaseType", "Gender", "Group_CNS_Involvement")
+for(col in cols_to_fix) {
+  # Force conversion to character then numeric to break factor levels
+  final_data_ML[[col]] <- as.numeric(as.character(final_data_ML[[col]]))
+}
+
+print("Columns that are STILL not numeric:")
+print(names(final_data_ML)[!sapply(final_data_ML, is.numeric)])
+main_dir <- "MachineLearning"
+dir.create(main_dir, showWarnings = FALSE)
+# Create subdirectories for each model type
+rf_dir <- file.path(main_dir, "RF")
+lasso_dir <- file.path(main_dir, "LASSO")
+svm_dir <- file.path(main_dir, "SVM")
+dir.create(rf_dir, showWarnings = FALSE)
+dir.create(lasso_dir, showWarnings = FALSE)
+dir.create(svm_dir, showWarnings = FALSE)
+
+
+#***************************
+#      Random Forest
+#***************************
+
+# Define the metadata/ID columns (non-assay columns)
+metadata_cols <- c( "WellID", "PatientID", "Visit", "Visitcode", "CNS_Involvement" )
+
+# Identify the assay columns
+assay_cols <- names(final_data_ML)[!names(final_data_ML) %in% metadata_cols]
+
+# Prepare data
+rf_data_Visitcode <- na.omit(final_data_ML)
+rf_data_Visitcode$Visitcode <- as.factor(rf_data_Visitcode$Visitcode)
+
+cols_to_keep_VC <- c("Visitcode", assay_cols)
+# Subset the data frame to contain ONLY the target and the features (assays)
+rf_data_Visitcode <- rf_data_Visitcode[, cols_to_keep_VC]
+
+# Run Random Forest_Feature Selection 
+set.seed(123)
+rf_model_Visitcode <- randomForest(Visitcode ~ ., data = rf_data_Visitcode, importance = TRUE)
+
+imp_Visitcode <- importance(rf_model_Visitcode)
+imp_Visitcode_df <- data.frame(Protein = rownames(imp_Visitcode), MeanDecreaseGini = imp_Visitcode[, "MeanDecreaseGini"])
+imp_Visitcode_df <- imp_Visitcode_df[order(-imp_Visitcode_df$MeanDecreaseGini), ]
+# Prepare top 30
+imp_Visitcode_df_top30 <- imp_Visitcode_df[1:30, ] %>%
+  rownames_to_column("Feature") %>%
+  arrange(desc(MeanDecreaseGini))
+
+# Define breaks and labels for bins
+size_breaks <- c(-Inf, 0.60, 0.90, 1.20, 1.50, Inf) # 5 intervals focused on the <1.5 range
+size_labels <- c("≤0.60", "0.60–0.90", "0.90–1.20", "1.20–1.50", "≥1.50")
+size_map <- c(
+  "≤0.60" = 2,
+  "0.60–0.90" = 4,
+  "0.90–1.20" = 6,
+  "1.20–1.50" = 8,
+  "≥1.50" = 10
+)
+
+# Add SizeBin factor column
+imp_Visitcode_df_top30$SizeBin <- cut(
+  imp_Visitcode_df_top30$MeanDecreaseGini,
+  breaks = size_breaks,
+  labels = size_labels,
+  right = TRUE,
+  include.lowest = TRUE
+)
+
+# Fix any NAs in SizeBin by assigning lowest/highest bin (if any)
+imp_Visitcode_df_top30$SizeBin[is.na(imp_Visitcode_df_top30$SizeBin) & imp_Visitcode_df_top30$MeanDecreaseGini < min(size_breaks)] <- size_labels[1]
+imp_Visitcode_df_top30$SizeBin[is.na(imp_Visitcode_df_top30$SizeBin) & imp_Visitcode_df_top30$MeanDecreaseGini > max(size_breaks)] <- size_labels[length(size_labels)]
+
+# Plot with discrete size scale
+p <- ggplot(imp_Visitcode_df_top30, aes(x = MeanDecreaseGini, y = reorder(Feature, MeanDecreaseGini))) +
+  geom_point(aes(size = SizeBin), color = "#1271c9") +
+  scale_size_manual(
+    name = "Avg. MDGini",
+    values = size_map,
+    guide = guide_legend(override.aes = list(color = "#1271c9"))
+  ) +
+  
+  theme_light() +
+  theme(
+    axis.text.y = element_text(color = "black", size = 10),
+    axis.text.x = element_text(color = "black", size = 10),
+    axis.title = element_text(size = 12),
+    legend.text = element_text(color = "black", size = 12),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )+xlab("Average MDGini") +
+  ylab("Proteins") +
+  ggtitle("Top 30 important features_RF")
+ggsave(filename = file.path(rf_dir, "RF_Top30_Importance.tiff"), 
+       plot = p, width = 10, height = 8, dpi = 300)
+write.csv(imp_Visitcode_df, file = file.path(rf_dir, "RF_Full_Importance.csv"), row.names = FALSE)
+write.csv(imp_Visitcode_df_top30, file = file.path(rf_dir, "RF_Top30_Importance.csv"), row.names = FALSE)
+
+dev.new(width = 10, height =20, noRStudioGD = TRUE)
+
+# RF-ROC
+sum(is.na(final_data_ML[, assay_cols]))
+
+# Use the existing cleaned data frame
+rf_data_roc <- final_data_ML
+rf_data_roc$Visitcode <- as.factor(rf_data_roc$Visitcode)
+
+# Train/Test split (80% Training, 20% Testing)
+set.seed(123)
+# Create index for splitting the data
+train_idx <- createDataPartition(rf_data_roc$Visitcode, p = 0.8, list = FALSE)
+train_data_VC <- rf_data_roc[train_idx, ]
+test_data_VC  <- rf_data_roc[-train_idx, ]
+
+# Separate target from features
+# Ensure only numeric assay columns and the target 'Visitcode' are used
+train_subset <- train_data_VC[, c("Visitcode", assay_cols)]
+test_subset  <- test_data_VC[, c("Visitcode", assay_cols)]
+
+#replacing only one cell with median
+train_subset <- na.roughfix(train_subset)
+test_subset  <- na.roughfix(test_subset)
+
+
+# Re-train the model on the 80% training set
+set.seed(123)
+rf_model_ROC <- randomForest(Visitcode ~ ., data = train_subset, importance = TRUE)
+
+# Predict probabilities on the 20% test set
+pred_probs_VC <- predict(rf_model_ROC, newdata = test_subset, type = "prob")
+
+# Calculate and Plot ROC
+library(pROC)
+target_class <- "VR"
+
+# Generate ROC object
+roc_obj <- roc(test_subset$Visitcode == target_class, pred_probs_VC[, target_class])
+auc_val <- auc(roc_obj)
+
+# Create Visualization
+roc_df <- data.frame(
+  fpr = 1 - roc_obj$specificities, 
+  tpr = roc_obj$sensitivities
+)
+
+p_roc <- ggplot(roc_df, aes(x = fpr, y = tpr)) +
+  geom_line(color = "#1271c9", linewidth = 1.2) + 
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray") +
+  annotate("text", x = 0.6, y = 0.2, 
+           label = paste0("AUC = ", round(auc_val, 3)), 
+           size = 6, fontface = "bold") +
+  labs(title = paste("ROC Curve (80/20 Split) -", target_class),
+       x = "False Positive Rate (1 - Specificity)",
+       y = "True Positive Rate (Sensitivity)") +
+  theme_light()+
+  theme(
+    axis.text.y = element_text(color = "black", size = 10),
+    axis.text.x = element_text(color = "black", size = 10),
+    axis.title = element_text(size = 12),
+    legend.text = element_text(color = "black", size = 12),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )
+
+print(p_roc)
+ggsave(filename = file.path(rf_dir, "RF_ROC_Curve.png"), 
+       plot = p_roc, width = 8, height = 6, dpi = 300)
+
+#RF-cross validation
+
+# 5-fold Cross-Validation for Visitcode
+set.seed(1234)
+
+# Assuming imp_Visitcode_df_top30$Feature contains the names
+top_features <- imp_Visitcode_df_top30$Feature
+
+# This filters out the 'noise' from other proteins
+target_col_vc <- "Visitcode"
+df_cv_vc <- rf_data_Visitcode[, c(target_col_vc, top_features)]
+
+k <- 5
+n <- nrow(df_cv_vc)
+
+# Create stratified folds to ensure balanced classes
+folds <- integer(n)
+cls <- df_cv_vc[[target_col_vc]]
+
+for (lev in levels(cls)) {
+  idx <- which(cls == lev)
+  idx <- sample(idx, length(idx), replace = FALSE)
+  grp_ids <- rep(1:k, length.out = length(idx))
+  folds[idx] <- grp_ids
+}
+
+# Identify feature names (proteins/assays)
+feat_names <- setdiff(colnames(df_cv_vc), target_col_vc)
+
+# Initialize storage for results
+cv_models_vc <- vector("list", k)
+cv_acc_vc <- numeric(k)
+cv_conf_vc <- vector("list", k)
+names(cv_models_vc) <- names(cv_acc_vc) <- names(cv_conf_vc) <- paste0("Fold", 1:k)
+
+# Matrix to store Gini importance for each fold
+cv_import_vc <- matrix(NA_real_, nrow = length(feat_names), ncol = k,
+                       dimnames = list(feat_names, paste0("Fold", 1:k)))
+
+cat("Starting 5-fold CV for Visitcode (Random Forest)\n")
+
+for (i in 1:k) {
+# Standard CV: Train on 4 folds, Test on 1 fold
+  train_i <- df_cv_vc[folds != i, ] 
+  test_i  <- df_cv_vc[folds == i, ]
+  
+# Train Random Forest model for Visitcode
+  rf_i <- randomForest(
+    as.formula(paste(target_col_vc, "~ .")),
+    data = train_i,
+    importance = TRUE
+  )
+  
+# Predict on the hold-out fold
+  pred_i <- predict(rf_i, newdata = test_i)
+  
+# Calculate fold accuracy
+  acc_i <- mean(pred_i == test_i[[target_col_vc]])
+  
+  run_name <- paste0("Fold", i)
+  cv_models_vc[[run_name]] <- rf_i
+  cv_acc_vc[run_name] <- acc_i
+  cv_conf_vc[run_name] <- list(table(Truth = test_i[[target_col_vc]], Pred = pred_i))
+  
+# Extract MeanDecreaseGini
+  if (!is.null(rf_i$importance)) {
+    common_feats <- intersect(feat_names, rownames(rf_i$importance))
+    cv_import_vc[common_feats, run_name] <- rf_i$importance[common_feats, "MeanDecreaseGini"]
+  }
+  cat(sprintf("\n %s Result: Accuracy = %.3f\n", run_name, acc_i))
+  print(cv_conf_vc[[run_name]])
+}
+write.csv(cv_import_vc, file = file.path(rf_dir, "RF_CV_Importance_Per_Fold.csv"))
+
+# Create a summary table for the accuracy of each fold
+cv_res_df <- data.frame(Fold = names(cv_acc_vc), Accuracy = as.numeric(cv_acc_vc))
+# Add the average accuracy across all folds to the summary table
+cv_res_df <- rbind(cv_res_df, data.frame(Fold = "Average", Accuracy = mean(cv_acc_vc)))
+# Save the accuracy results to a CSV file in the RF directory
+write.csv(cv_res_df, file = file.path(rf_dir, "RF_CV_Accuracy.csv"), row.names = FALSE)
+# Export the Confusion Matrix of all folds into a text file for detailed error analysis
+sink(file.path(rf_dir, "RF_CV_Confusion_Matrices.txt"))
+cat("Confusion Matrices for Each Fold\n")
+print(cv_conf_vc)
+sink()
+
+cat("\nOverall mean accuracy across 5 folds (Visitcode):\n")
+print(mean(cv_acc_vc))
+
+agg_conf_vc <- Reduce(`+`, cv_conf_vc)
+cat("\nAggregated Confusion Matrix for Visitcode:\n")
+print(agg_conf_vc)
+
+
+mean_imp_cv_vc <- sort(rowMeans(cv_import_vc, na.rm = TRUE), decreasing = TRUE)
+cat("\nTop 10 features for Visitcode (Mean Gini across runs):\n")
+print(round(head(mean_imp_cv_vc, 10), 3))
+
+mean_imp_df <- data.frame(
+  Feature = names(mean_imp_cv_vc),
+  Mean_Gini_Importance = as.numeric(mean_imp_cv_vc)
+)
+
+
+# DEFINE THE FUNCTION
+plot_cm <- function(cm, title, acc, subtitle = "", palette = "train") {
+  library(ggplot2)
+  m <- as.data.frame(cm$table)
+  colnames(m) <- c("Predicted","True","Freq")
+  
+  ggplot(m, aes(Predicted, True, fill = Freq)) +
+    geom_tile(color = "white", linewidth = 1.2) +
+    geom_text(aes(label = Freq), color = "black",
+              size = 8, fontface = "bold") +
+    scale_fill_gradient(
+      low = "#e8f5e9", # Light Green
+      high = "#2e7d32", # Dark Forest Green
+      guide = guide_colourbar(
+        barheight = unit(15, "lines"), 
+        barwidth = unit(1, "lines"),
+        ticks.colour = "black",
+        frame.colour = "black"
+      )
+    ) +
+    labs(
+      title = paste0(title, " (Accuracy = ", acc, ")"),
+      subtitle = subtitle,
+      x = "Predicted label",
+      y = "True label",
+      fill = NULL
+    ) +
+    theme_minimal(base_size = 18) +
+    theme(
+      plot.title = element_text(size = 16, face = "bold", hjust=0.5),
+      plot.subtitle = element_text(size = 12, face = "italic", color = "gray20"),
+      axis.text = element_text(color="black", size = 16),
+      legend.title = element_blank(),
+      legend.text = element_text(size = 14)
+    )
+}
+
+# GENERATE THE PLOT OBJECT
+cm_cv_aggregated <- list(table = as.table(agg_conf_vc))
+cv_total_acc <- round(sum(diag(agg_conf_vc)) / sum(agg_conf_vc), 3)
+
+p_cm_cv <- plot_cm(
+  cm = cm_cv_aggregated, 
+  title = "RF_ Aggregated CV Confusion Matrix", 
+  acc = cv_total_acc, 
+  palette = "train" 
+)
+dev.new(width = 10, height = 20, noRStudioGD = TRUE)
+print(p_cm_cv)
+
+
+tiff(file.path(rf_dir, "CM_Validation.tiff"), width = 10, height = 8, units = "in", res = 300, compression = "lzw")
+print(p_cm_cv)
+dev.off()
+
+#Top-10
+
+# Select top 10 important features
+top_n_VC <- 10
+top10_selected_RF_VC <- imp_Visitcode_df %>%
+  slice(1:top_n_VC) %>%
+  rownames_to_column("Feature") %>%
+  arrange(desc(MeanDecreaseGini))
+print(top10_selected_RF_VC)
+
+# Define size bins and labels
+size_breaks <- c(-Inf, 0.60, 0.90, 1.20, 1.50, Inf) 
+size_labels <- c("≤0.60", "0.60–0.90", "0.90–1.20", "1.20–1.50", "≥1.50")
+size_map <- c(
+  "≤0.60" = 2,
+  "0.60–0.90" = 4,
+  "0.90–1.20" = 6,
+  "1.20–1.50" = 8,
+  "≥1.50" = 10
+)
+
+# Add Size Bin column
+top10_selected_RF_VC <- top10_selected_RF_VC %>%
+  mutate(
+    SizeBin = cut(
+      MeanDecreaseGini,
+      breaks = size_breaks,
+      labels = size_labels,
+      right = TRUE,
+      include.lowest = TRUE
+    )
+  )
+
+
+# Plot with legend inside
+p_top10_VC <- ggplot(top10_selected_RF_VC, aes(x = MeanDecreaseGini, y = reorder(Feature, MeanDecreaseGini))) +
+  geom_point(aes(size = SizeBin), color = "#1271c9") +
+  scale_size_manual(
+    name = "Avg. MDGini",
+    values = size_map,
+    drop = FALSE,
+    guide = guide_legend(override.aes = list(color = "#1271c9"))
+  ) +
+  theme_light() +
+  theme(
+    axis.text.y = element_text(color = "black", size = 10),
+    axis.text.x = element_text(color = "black", size = 10),
+    axis.title = element_text(size = 12),
+    legend.text = element_text(color = "black", size = 12),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )+xlab("Average MDGini") +
+  ylab("Proteins") +
+  ggtitle("Top important proteins_RF")
+
+ggsave(filename = file.path(rf_dir, "RF_top10_VC.tiff"), 
+       plot = p_top10_VC, width = 15, height = 10, dpi = 300)
+
+
+print(p_top10_VC)
+
+
+#RF-Top10_Boxplots
+
+# top 10 features
+top10_features_VC <- top10_selected_RF_VC$Feature
+# Select top 10 proteins plus the grouping column ('Visitcode') from full dataset
+plot_data_imp_groups_RF_VC <- final_data_ML %>%
+  select(all_of(c(top10_features_VC, "Visitcode"))) %>% 
+  pivot_longer(cols = all_of(top10_features_VC), names_to = "Protein", values_to = "Expression")
+
+
+# plot boxplots + jitter faceted by protein
+p_imp_groups_RF_VC <- ggplot(plot_data_imp_groups_RF_VC, aes(x = Visitcode, y = Expression, fill = Visitcode)) +
+  geom_boxplot(width = 0.8, alpha = 0.8, color = "black", outlier.size = 0.5) +
+  geom_jitter(width = 0.1, size = 0.5, alpha = 0.8) +
+  facet_wrap(~Protein, ncol = 5, scales = "free_y") +
+  scale_fill_manual(values = c("VD" = "#ff704d", "VR" = "#668cff")) +
+  theme_bw() +
+  labs(
+    title = "Top Proteins_RF",
+    y = "Protein abundant (NPX)",
+    x = "Groups",
+    fill = "Groups"
+  ) +
+  theme(
+    axis.text = element_text(color = "black", size = 16), 
+    axis.title = element_text(color = "black", size = 16),
+    
+# PROTEIN NAME SETTING
+    strip.background = element_rect(fill = "white", color = "black", size = 1),
+    strip.text = element_text(size = 15, face = "plain", color = "black"),
+    plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+# Total font and gard
+    text = element_text(family = "Arial"),
+    panel.border = element_rect(color = "black", fill = NA, size = 1), 
+    
+# Eleminate grids line
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    
+    legend.position = "none"
+  )
+ggsave(filename = file.path(rf_dir, "RF_Top10_Boxplots.png"), 
+       plot =  p_imp_groups_RF_VC, width = 15, height = 10, dpi = 300)
+
+print(p_imp_groups_RF_VC)
+
+
+# Uses the cleaned, final data frame 'rf_data_Visitcode'
+VD_features_data <- rf_data_Visitcode[rf_data_Visitcode$Visitcode == "VD", ]
+VR_features_data <- rf_data_Visitcode[rf_data_Visitcode$Visitcode == "VR", ]
+
+# top10_features_VC holds top 10 protein names
+VD_matrix <- VD_features_data[, top10_features_VC]
+VR_matrix <- VR_features_data[, top10_features_VC]
+
+# Top 10 features
+top10_features_VC <- top10_selected_RF_VC$Feature
+top10_heatmap_data_VC <- final_data_ML[, top10_features_VC, drop = FALSE]
+# Group vector
+group_vec_VC <- final_data_ML$Visitcode
+
+# Order samples by group
+order_idx_VC <- order(group_vec_VC)
+top10_heatmap_data_VC <- top10_heatmap_data_VC[order_idx_VC, ]
+group_ordered_VC <- group_vec_VC[order_idx_VC]
+
+# Transpose: proteins as rows, samples as columns
+top10_heatmap_data_VC <- t(as.matrix(top10_heatmap_data_VC))
+colnames(top10_heatmap_data_VC) <- final_data_ML$PatientID[order_idx_VC]
+
+# Define colors for groups
+group_colors <- c("VD" = "#ff704d", "VR" = "#668cff")
+
+# Create column annotation with non-bold legend titles
+annotation_col_VC <- HeatmapAnnotation(
+  Groups = group_ordered_VC,
+  col = list(Groups = group_colors),
+  annotation_name_side = "right",
+  annotation_legend_param = list(
+    Groups = list(title = "Groups", title_gp = gpar(fontsize = 14, fontface = "plain"))
+  )
+)
+# Draw heatmap with non-bold NPX legend title
+ht_VC <- Heatmap(
+  top10_heatmap_data_VC,
+  name = "NPX",
+  top_annotation = annotation_col_VC,
+  cluster_columns = FALSE,
+  show_column_names = TRUE,
+  column_names_rot = 90,
+  column_names_gp = gpar(fontsize = 6),
+  row_names_gp = gpar(fontsize = 14),
+  column_title = "Important features selected by RF (Top 10)_Visitcode",
+  column_title_gp = gpar(fontsize = 14, fontface = "bold"),
+  heatmap_legend_param = list(
+    title_gp = gpar(fontsize = 14, fontface = "plain") 
+  )
+)
+tiff(file.path(rf_dir, "RF_Heatmap_Top10.tiff"), width = 1200, height = 1000, res = 120)
+
+draw(ht_VC, heatmap_legend_side = "right", annotation_legend_side = "right")
+
+
+#***************************
+#     LASSO
+#***************************
+
+# Define the metadata/ID columns (non-assay columns)
+metadata_cols <- metadata_cols <-c( "WellID", "PatientID", "Visit", "Visitcode", "CNS_Involvement" )
+
+# Identify the assay columns
+assay_cols <- names(final_data_ML)[!names(final_data_ML) %in% metadata_cols]
+
+# Perform NA-Omit on Assay Columns Only 
+initial_rows <- nrow(final_data_ML)
+final_data_ML <- final_data_ML %>%
+  na.omit(subset = assay_cols)
+
+# --- Check Results ---
+removed_rows <- initial_rows - nrow(final_data_ML)
+
+cat("          Assay-Specific NA Removal             \n")
+cat(paste("Initial number of rows:", initial_rows, "\n"))
+cat(paste("Rows remaining (complete cases):", nrow(final_data_ML), "\n"))
+cat(paste("Total rows removed (due to NA in an assay):", removed_rows, "\n"))
+
+#SCALING_VC
+# Metadata columns to exclude
+cols_to_exclude <- cols_to_exclude <- c( "WellID", "PatientID", "Visit", "Visitcode", "CNS_Involvement" )
+
+# Safely select the numeric assay columns and apply scale()
+scaled_assays <- final_data_ML %>%
+  select(-all_of(cols_to_exclude)) %>%
+  as.data.frame() %>%
+  scale() %>%
+  as.data.frame()
+
+# Add back the original metadata columns
+scaled_assays$Visitcode <- final_data_ML$Visitcode
+
+# Save the final scaled data frame
+final_data_ML_scaled <- scaled_assays
+
+cat("Scaling completed successfully. All original columns are now centered and scaled.\n")
+
+#GLMNET
+
+# Prepare data
+y <- as.factor(final_data_ML_scaled$Visitcode)
+x <- as.matrix(final_data_ML_scaled[, colnames(final_data_ML_scaled) != "Visitcode"])
+
+# Fit LASSO multinomial model with cross-validation
+set.seed(123)
+cvfit_VC <- cv.glmnet(
+  x, y,
+  family = "multinomial",
+  type.measure = "class",
+  nfolds = 10
+)
+
+
+tiff(filename = file.path(lasso_dir, "cvfit_VC.tiff"), width = 10, height = 8, units = "in", res = 300)
+par(mar = c(5, 5, 7, 2)) 
+plot(cvfit_VC)
+title(expression(bold("Cross-Validation curve for LASSO (Selected " * lambda == lambda[1*se] * ")")), line = 3)
+dev.off()
+
+par(mar = c(5, 5, 7, 2))
+
+
+plot(cvfit_VC)
+title(expression(bold("Cross-Validation curve for LASSO (Selected " * lambda == lambda[1*se] * ")")), 
+      line = 3, cex.main = 1.2)
+
+#LASSO: Coefficients
+# Extract selected lambda
+lambda_1se <- cvfit_VC$lambda.1se
+cat("Selected lambda.1se:", lambda_1se, "\n")
+
+# Extract coefficients for all classes
+coefs_VC <- coef(cvfit_VC, s = lambda_1se)
+
+# Extract coefficients for all classes
+coefs_VC <- coef(cvfit_VC, s = lambda_1se)
+
+# Collect non-zero features across classes
+lasso_selected_proteins <- unique(unlist(lapply(coefs_VC, function(class_coef) {
+  rownames(class_coef)[which(class_coef != 0)]
+})))
+lasso_selected_proteins <- setdiff(lasso_selected_proteins, "(Intercept)")
+
+cat("Number of selected proteins:", length(lasso_selected_proteins), "\n")
+write.csv(lasso_selected_proteins, 
+          file = file.path(lasso_dir, "LASSO_Selected_Proteins.csv"), 
+          row.names = FALSE)
+
+print(lasso_selected_proteins)
+
+# Extract coefficients at lambda.1se 
+coefs_VC <- coef(cvfit_VC, s = lambda_1se)
+
+# Tidy to long data.frame
+coef_df_VC <- bind_rows(lapply(names(coefs_VC), function(class_name) {
+  mat <- as.matrix(coefs_VC[[class_name]])
+  data.frame(
+    Proteins = rownames(mat),
+    Coefficient = as.numeric(mat[, 1]),
+    Groups = class_name,
+    stringsAsFactors = FALSE
+  )
+})) %>%
+  filter(Proteins != "(Intercept)", Coefficient != 0)
+
+# Extract unique list of proteins selected by LASSO (non-zero coefficients)
+lasso_selected_proteins_VC <- coef_df_VC %>%
+  distinct(Proteins) %>%
+  pull(Proteins) %>%
+  as.character()
+
+# Print the number of selected biomarkers
+cat("Number of LASSO-selected proteins (VC):", length(lasso_selected_proteins_VC), "\n")
+
+# Order proteins by mean absolute coefficient across groups
+protein_order_VC <- coef_df_VC %>%
+  group_by(Proteins) %>%
+  summarize(AvgAbsCoef = mean(abs(Coefficient)), .groups = "drop") %>%
+  arrange(desc(AvgAbsCoef)) %>%
+  pull(Proteins)
+write.csv(coef_df_VC, 
+          file = file.path(lasso_dir, "LASSO_Detailed_Weights_VC.csv"), 
+          row.names = FALSE)
+
+
+# Prep for plotting
+group_order_levels_VC <- sort(unique(coef_df_VC$Groups))
+group_colors_VC <- c("VD" = "#ff704d", "VR" = "#668cff")
+
+coef_df_selected_VC <- coef_df_VC %>%
+  mutate(
+    Feature = Proteins,
+    Value   = Coefficient,
+    Groups  = factor(as.character(Groups), levels = group_order_levels_VC),
+    StrengthBin = cut(abs(Coefficient),
+                      breaks = c(-Inf, 0.05, 0.10, 0.15, Inf),
+                      labels = c("< 0.05", "0.05–0.10", "0.10–0.15", "> 0.15"),
+                      right = TRUE)
+  ) %>%
+  mutate(
+    Feature = factor(Feature, levels = rev(protein_order_VC)),
+    StrengthBin = factor(StrengthBin,
+                         levels = c("< 0.05", "0.05–0.10", "0.10–0.15", "> 0.15"))
+  )
+
+# Size mapping
+size_values <- c("< 0.05" = 4, "0.05–0.10" = 6, "0.10–0.15" = 8, "> 0.15" = 10)
+
+# Plot
+p_lasso_coef_VC <- ggplot(coef_df_selected_VC, aes(x = Value, y = Feature)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(aes(color = Groups, size = StrengthBin),
+             alpha = 0.95,
+             position = position_dodge(width = 0.4)) +
+  scale_color_manual(
+    name   = "Groups",
+    values = group_colors_VC,
+    breaks = group_order_levels_VC,
+    limits = group_order_levels_VC,
+    drop   = FALSE
+  ) +
+  scale_size_manual(
+    name = "Coefficient\nStrength",
+    values = size_values,
+    guide = guide_legend(
+      title.position = "top",
+      title.hjust = 0.5,
+      override.aes = list(color = "grey20")
+    )
+  ) +
+  theme_light() +
+  xlab("Coefficient") +
+  ylab("Proteins") +
+  ggtitle("LASSO selected proteins coefficients at lambda.1se") +
+  theme(
+    axis.text.y = element_text(color = "black", size = 10),
+    axis.text.x = element_text(color = "black", size = 10),
+    axis.title = element_text(size = 12),
+    legend.text = element_text(color = "black", size = 12, hjust = 0.5),
+    legend.box.just = "center",      
+    legend.title = element_text(hjust = 0.5, size = 11, face = "bold"), 
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    legend.position = "right",
+  )
+ggsave(
+  filename = file.path(lasso_dir, "p_lasso_coef_VC_pointdesign.tiff"),
+  plot = p_lasso_coef_VC,
+  width = 10,
+  height = 8,
+  dpi = 300
+)
+print(p_lasso_coef_VC)
+
+
+# Use lasso_selected_proteins vector directly
+lasso_features_VC <- lasso_selected_proteins_VC
+
+# Select those proteins plus group info from full proteomics data
+plot_data_lasso_groups_VC <- final_data_ML %>%
+  select(all_of(c(lasso_features_VC, "Visitcode"))) %>%
+  pivot_longer(cols = all_of(lasso_features_VC), names_to = "Protein", values_to = "Expression")
+
+# Plot boxplots with jitter faceted by protein_VC
+p_lasso_groups_VC <- ggplot(plot_data_lasso_groups_VC, aes(x = Visitcode, y = Expression, fill = Visitcode)) +
+  geom_boxplot(width = 0.8, alpha = 0.8, color = "black", outlier.size = 0.5) +
+  geom_jitter(width = 0.2, size = 0.5, alpha = 0.8) +
+  facet_wrap(~Protein, ncol = 5, scales = "free_y") +
+  scale_fill_manual(values = c("VD" = "#ff704d", "VR" = "#668cff")) +
+  theme_bw() +
+  labs(
+    title = "LASSO-Selected Proteins", # Main title
+    y = "Protein Expression (NPX)",
+    x = "Groups",
+    fill = "Groups"
+  ) +
+  theme(
+    axis.text = element_text(color = "black", size = 16), 
+    axis.title = element_text(color = "black", size = 16),
+    
+# PROTEIN NAME SETTING
+    strip.background = element_rect(fill = "white", color = "black", size = 1),
+    strip.text = element_text(size = 15, face = "plain", color = "black"),
+    plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+# Total font and gard
+    text = element_text(family = "Arial"),
+    panel.border = element_rect(color = "black", fill = NA, size = 1), 
+    
+# Eleminate grids line
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    
+    legend.position = "none"
+  )
+ggsave(filename = file.path(lasso_dir, "p_lasso_groups_VC.tiff"), 
+       plot = p_lasso_groups_VC, width = 10, height = 8, dpi = 300)
+
+# Show plot 
+print(p_lasso_groups_VC)
+
+
+
+#Lasso confusion matrix
+lasso_preds <- predict(cvfit_VC, newx = x, s = "lambda.1se", type = "class")
+lasso_conf_matrix <- table(Predicted = as.factor(lasso_preds), Actual = y)
+
+# (Accuracy)
+lasso_acc_round <- round(sum(diag(lasso_conf_matrix)) / sum(lasso_conf_matrix), 3)
+cm_lasso_list <- list(table = as.table(lasso_conf_matrix))
+
+p_cm_lasso <- plot_cm(
+  cm = cm_lasso_list, 
+  title = " LASSO Confusion Matrix", 
+  acc = lasso_acc_round, 
+  palette = "train" 
+) + 
+  scale_fill_gradient(
+    low = "#e8f5e9", 
+    high = "#2e7d32", 
+    guide = guide_colourbar(
+      barheight = unit(15, "lines"),
+      barwidth = unit(1, "lines"),
+      ticks.colour = "black",
+      frame.colour = "black"
+    )
+  )
+ggsave(filename = file.path(lasso_dir, "LASSO_CM_Validation.tiff"), 
+       plot = p_cm_lasso, 
+       width = 8, 
+       height = 8, 
+       dpi = 300, 
+       compression = "lzw")
+
+#LASSO-heatmap
+
+
+# ubset scaled proteomics matrix to the LASSO-selected proteins
+heatmap_data_VC <- final_data_ML_scaled[, lasso_selected_proteins_VC] 
+# Prepare group vector
+group_vec_VC <- final_data_ML_scaled$Visitcode
+
+# Order samples by group, then by cluster within each group
+order_idx_VC <- order(group_vec_VC)
+heatmap_data_VC <- heatmap_data_VC[order_idx_VC, ]
+group_ordered_VC <- group_vec_VC[order_idx_VC]
+
+# Transpose data for ComplexHeatmap (proteins as rows)
+heatmap_data_VC <- t(heatmap_data_VC)
+colnames(heatmap_data_VC) <- final_data_ML$PatientID[order_idx_VC]
+
+# Define colors for Group 
+group_colors <- c(
+  "VD" = "#ff704d",
+  "VR" = "#668cff"
+)
+
+#Create annotations
+annotation_col_VC <- HeatmapAnnotation(
+  Groups = group_ordered_VC,
+  col = list(Groups = group_colors),
+  annotation_name_side = "right"
+)
+
+# Draw heatmap
+ht_VC<- Heatmap(
+  heatmap_data_VC,
+  name = "NPX",
+  top_annotation = annotation_col_VC,
+  cluster_columns = FALSE,
+  show_column_names = TRUE,
+  column_names_rot = 90,
+  column_names_gp = gpar(fontsize = 8),
+  row_names_gp = gpar(fontsize = 20),
+  column_title = "LASSO",
+  column_title_gp = gpar(fontsize = 18, fontface = "bold"),
+  heatmap_legend_param = list(
+    title_gp = gpar(fontsize = 18, fontface = "plain") # NPX legend title non-bold
+  )
+)
+draw(ht_VC, heatmap_legend_side = "right", annotation_legend_side = "right")
+# Save LASSO Heatmap
+tiff(file.path(lasso_dir, "LASSO_Heatmap_Top.tiff"), width = 1200, height = 1000, res = 120)
+draw(ht_VC, heatmap_legend_side = "right", annotation_legend_side = "right")
+dev.off() # Close the file
+
+#***************************
+#         SVM
+#***************************
+# PREPARE DATA
+metadata_cols <- c("WellID", "PatientID", "Visit", "Visitcode", "CNS_Involvement")
+actual_features <- setdiff(colnames(final_data_ML_scaled), metadata_cols)
+
+y <- as.factor(final_data_ML$Visitcode)
+x <- as.matrix(final_data_ML_scaled[rownames(final_data_ML), actual_features])
+storage.mode(x) <- "numeric"
+
+#  BASIC SVM (RADIAL) 
+set.seed(123)
+tuned_svm <- tune.svm(
+  x, y,
+  kernel = "radial",
+  cost = c(0.1, 1, 10, 100),  
+  gamma = c(0.001, 0.01, 0.1, 1) 
+)
+
+best_svm_model <- tuned_svm$best.model
+saveRDS(best_svm_model, file = file.path(svm_dir, "best_svm_model.rds"))
+
+pred_VC <- predict(best_svm_model, x)
+svm_acc <- mean(pred_VC == y)
+
+
+#CARET SVM (WITH CV)
+levels(y) <- make.names(levels(y)) 
+
+set.seed(123)
+train_control_VC <- trainControl(method = "cv", number = 5, classProbs = TRUE, savePredictions = "final")
+svm_fit_VC <- train(x = x, y = y, method = "svmRadial", trControl = train_control_VC, tuneLength = 5)
+
+# Save Tuning Plot
+while (!is.null(dev.list())) dev.off()
+tiff(filename = file.path(svm_dir, "SVM_Tuning_Results.tiff"), 
+     width = 10, height = 8, units = "in", res = 300)
+print(plot(svm_fit_VC, 
+           main = "Grid Search Results for SVM Radial Model (Accuracy vs Parameters)",
+           sub = "Cross-Validation Accuracy across different Sigma and Cost values"))
+
+#FEATURE SELECTION (RFE)
+#Running RFE first so 'svm_profile_VC' is created before usage
+set.seed(123)
+rfe_control_VC <- rfeControl(functions = caretFuncs, method = "cv", number = 5)
+
+svm_profile_VC <- rfe(
+  x = x, y = y,
+  sizes = seq(5, ncol(x), 5),
+  rfeControl = rfe_control_VC,
+  method = "svmRadial",   
+  tuneLength = 3
+)
+
+print(svm_profile_VC)
+
+
+
+#EVALUATE RFE RESULTS
+rfe_preds <- predict(svm_profile_VC, x)
+rfe_acc <- mean(rfe_preds == y)
+
+p_cm_rfe <- plot_cm(
+  cm = list(table = as.table(table(Predicted = rfe_preds, Actual = y))), 
+  title = "SVM-RFE Optimized Confusion Matrix", 
+  acc = round(rfe_acc, 3), 
+  subtitle = paste("Based on the top", svm_profile_VC$optsize, "selected proteins"), 
+  palette = "train" 
+) + 
+  scale_fill_gradient(low = "#e8f5e9", high = "#2e7d32", 
+                      guide = guide_colourbar(barheight = unit(15, "lines"), barwidth = unit(1, "lines")))
+ggsave(filename = file.path(svm_dir, "SVM_RFE_Final_CM.tiff"), plot = p_cm_rfe, 
+       width = 8, height = 8, dpi = 300, compression = "lzw")
+print(p_cm_rfe)
+
+
+
+#Retrain model using selected features from RFE
+selected_features <- predictors(svm_profile_VC)
+
+cat("Number of selected features:", length(selected_features), "\n")
+
+# Create new dataset with only selected features
+x_selected <- x[, selected_features]
+
+# Train final SVM using only important features
+set.seed(123)
+svm_fit_selected <- train(
+  x = x_selected,
+  y = y,
+  method = "svmRadial",
+  trControl = train_control_VC,
+  tuneLength = 5
+)
+svm_importance <- varImp(svm_fit_selected, scale = FALSE)
+write.csv(svm_importance$importance, file = file.path(svm_dir, "SVM_Feature_Importance.csv"))
+
+print(svm_fit_selected)
+
+
+#check
+cat("Number of rows (samples):", nrow(x), "\n")
+cat("Number of columns (features):", ncol(x), "\n")
+
+# Define the size vector outside of RFE
+rfe_sizes <- seq(5, ncol(x), 5) 
+
+cat("RFE feature subset sizes being tested:\n")
+print(rfe_sizes)
+write.csv(data.frame(RFE_Tested_Sizes = rfe_sizes), 
+          file = file.path(svm_dir, "RFE_Tested_Sizes.csv"), 
+          row.names = FALSE)
+# Use the column names from the matrix x to create the data frame
+x_df_VC <- as.data.frame(x) 
+
+# Ensure column names are clean and unique (essential for subsetting)
+colnames(x_df_VC) <- make.names(colnames(x_df_VC), unique = TRUE)
+
+cat("Number of unique, clean column names:", length(unique(colnames(x_df_VC))), "\n")
+
+
+#Extract top ranked features
+# Get variable importance from the RFE-selected model
+imp_VC <- caret::varImp(svm_profile_VC$fit, scale = FALSE)
+feature_ranks_VC <- imp_VC$importance
+feature_ranks_VC$Feature <- rownames(feature_ranks_VC)
+
+# Determine the importance score for ranking
+if ("Overall" %in% colnames(feature_ranks_VC)) {
+  score_VC <- feature_ranks_VC[["Overall"]]
+} else {
+  score_VC <- rowMeans(as.matrix(feature_ranks_VC[, setdiff(colnames(feature_ranks_VC), "Feature"), drop = FALSE]), na.rm = TRUE)
+}
+
+# Rank features and select top 25
+ord_VC <- order(-score_VC)
+feature_ranks_VC <- feature_ranks_VC[ord_VC, , drop = FALSE]
+
+k_VC <- 25 
+top25_features_VC <- rownames(feature_ranks_VC)[seq_len(k_VC)]
+top25_df <- feature_ranks_VC[1:k_VC, , drop = FALSE]
+
+# Save the list (Corrected variable name here)
+write.csv(top25_df, file = file.path(svm_dir, "SVM_Top25_Features_List.csv"), row.names = TRUE)
+
+# Prepare data for ggplot
+importance_selected_VC <- top25_df
+# Ensure there is an 'Importance' column for the plot code
+if(!"Importance" %in% colnames(importance_selected_VC)) {
+  importance_selected_VC$Importance <- score_VC[1:k_VC]
+}
+
+# Plot
+p_VC <- ggplot(importance_selected_VC, aes(x = Importance, y = reorder(Feature, Importance))) +
+  geom_point(aes(size = Importance), color = "#1271c9") +
+  scale_size_continuous(name = "SVM Importance", range = c(2, 8)) +
+  theme_light() +
+  xlab("SVM Feature Importance") +
+  ylab("Proteins") +
+  ggtitle("Top 25 proteins _SVM-RFE") +
+  theme(
+    axis.text.y = element_text(color = "black", size = 10),
+    axis.text.x = element_text(color = "black", size = 10),
+    axis.title = element_text(size = 12),
+    legend.text = element_text(color = "black", size = 12),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )
+ggsave(filename = file.path(svm_dir, "p_VC_Top25.tiff"), plot = p_VC, width = 10, height = 8, dpi = 300)
+
+print(p_VC)
+
+#Top 10 for plotting 
+importance_top10_VC <- importance_selected_VC %>%
+  slice_head(n = 10)
+
+p_top10_VC <- ggplot(importance_top10_VC,
+                     aes(x = Importance, y = reorder(Feature, Importance))) +
+  geom_point(aes(size = Importance), color = "#1271c9") +
+  scale_size_continuous(
+    name = "SVM Importance",
+    range = c(2, 8),
+    guide = guide_legend(override.aes = list(color = "#1271c9"))
+  ) +
+  theme_light() +
+  xlab("SVM Feature Importance") +
+  ylab("Proteins") +
+  ggtitle("Top 10 Proteins_SVM-RFE") +
+  theme(
+    axis.text.y = element_text(color = "black", size = 10),
+    axis.text.x = element_text(color = "black", size = 10),
+    axis.title = element_text(size = 12),
+    legend.text = element_text(color = "black", size = 12),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )
+ggsave(filename = file.path(svm_dir, "p_top10_VC.tiff"), 
+       plot = p_top10_VC, width = 10, height = 8, dpi = 300)
+
+#Print the names
+cat("Top 10 features:\n")
+print(importance_top10_VC$Feature)
+options(repr.plot.width = 20, repr.plot.height = 12)
+
+# Top 10 features vector
+top10_features_VC <- importance_top10_VC %>%
+  pull(Feature) %>%
+  as.character()
+
+# Prepare grouping and ordering
+group_vec_VC <- final_data_ML$Visitcode
+order_idx_VC <- order(group_vec_VC)
+
+group_ordered_VC <- group_vec_VC[order_idx_VC]
+patient_ids_VC   <- final_data_ML$PatientID[order_idx_VC]
+
+# Ensure features exist
+top10_features_VC <- intersect(top10_features_VC, colnames(final_data_ML))
+stopifnot(length(top10_features_VC) > 0)
+
+# Subset + numeric only
+mat_VC <- final_data_ML[order_idx_VC, top10_features_VC, drop = FALSE]
+mat_VC <- mat_VC[, sapply(mat_VC, is.numeric), drop = FALSE]
+mat_VC <- as.matrix(mat_VC)
+
+# Scale and transpose
+heatmap_data_VC <- t(scale(mat_VC))
+colnames(heatmap_data_VC) <- patient_ids_VC
+
+# Annotation colors
+group_colors <- c("VD" = "#ff704d", "VR" = "#668cff")
+
+annotation_col_VC <- HeatmapAnnotation(
+  Groups = group_ordered_VC,
+  col = list(Groups = group_colors),
+  annotation_name_side = "right"
+)
+
+ht_VC <- Heatmap(
+  heatmap_data_VC,
+  name = "NPX",
+  top_annotation = annotation_col_VC,
+  column_split = group_ordered_VC,
+  show_column_names = TRUE,
+  column_names_rot = 90,
+  column_names_gp = gpar(fontsize = 6),
+  row_names_gp = gpar(fontsize = 10),
+  column_title = "Heatmap of Top 10 SVM-RFE features (Visitcode)",
+  column_title_gp = gpar(fontsize = 14, fontface = "bold"),
+  use_raster = FALSE
+)
+draw(ht_VC, heatmap_legend_side = "right", annotation_legend_side = "right")
+
+
+#***************************
+# Finding common proteins
+#***************************
+#preparing for venn diagram: Importance from each model
+# LASSO proteins (Visitcode)
+lasso_proteins_VC <- unique(as.character(lasso_features_VC))
+lasso_proteins_VC <- lasso_proteins_VC[!is.na(lasso_proteins_VC) & lasso_proteins_VC != ""]
+
+# RF proteins (Visitcode): from Feature column in top10 table
+rf_proteins_VC <- unique(as.character(top10_selected_RF_VC$Feature))
+rf_proteins_VC <- rf_proteins_VC[!is.na(rf_proteins_VC) & rf_proteins_VC != ""]
+
+# SVM proteins (Visitcode): from Feature column in top10 table
+svm_proteins_VC <- unique(as.character(importance_top10_VC$Feature))
+svm_proteins_VC <- svm_proteins_VC[!is.na(svm_proteins_VC) & svm_proteins_VC != ""]
+
+# Stable order of categories
+cats <- c("RF", "LASSO", "SVM")
+
+# Construct feature list
+feature_lists <- list(
+  RF    = rf_proteins_VC,
+  LASSO = lasso_proteins_VC,
+  SVM   = svm_proteins_VC
+)
+
+# Colors
+cols <- c(
+  RF    = "#984ea3",
+  LASSO = "#4daf4a",
+  SVM   = "#d95f02"
+)
+
+# Category labels with counts
+category_labels <- paste0(cats, " (", sapply(feature_lists[cats], length), ")")
+par(family = "Arial")
+
+# Venn diagram
+venn.plot <- venn.diagram(
+  x = feature_lists[cats],
+  filename = NULL,
+  col = "transparent",
+  fill = cols[cats],
+  alpha = 0.50,
+  cex = 3.5,
+  fontfamily = "Arial",
+  cat.cex = 2.2,
+  cat.fontfamily = "Arial",
+  cat.col = cols[cats],
+  category.names = category_labels,
+  main = "Proteins selected by models (RF/LASSO/SVM) — Visitcode",
+  main.cex = 1,
+  main.fontface = "bold",
+  main.fontfamily = "Arial",
+  scaled = FALSE,
+  euler.d = FALSE,
+  rotation.degree = 0
+)
+
+grid::grid.newpage()
+grid::grid.draw(venn.plot)
+tiff(filename = file.path(main_dir, "Venn_1_All_Models.tiff"), 
+     width = 12, 
+     height = 12, 
+     units = "in", 
+     res = 300)
+
+grid::grid.newpage()
+grid::grid.draw(venn.plot)
+dev.off()
+
+
+
+cat("\n================ SELECTED PROTEINS (Visitcode)================\n")
+
+# Use the vectors you already created above:
+selected_RF    <- rf_proteins_VC
+selected_LASSO <- lasso_proteins_VC
+selected_SVM   <- svm_proteins_VC
+
+cat("\nselected_RF (n =", length(selected_RF), "):\n")
+print(selected_RF)
+
+cat("\nselected_LASSO (n =", length(selected_LASSO), "):\n")
+print(selected_LASSO)
+
+cat("\nselected_SVM (n =", length(selected_SVM), "):\n")
+print(selected_SVM)
+
+cat("\n================ UNIQUE PROTEINS ================\n")
+
+RF_only    <- setdiff(selected_RF, union(selected_LASSO, selected_SVM))
+LASSO_only <- setdiff(selected_LASSO, union(selected_RF, selected_SVM))
+SVM_only   <- setdiff(selected_SVM, union(selected_RF, selected_LASSO))
+
+cat("\nRF only (n =", length(RF_only), "):\n")
+print(RF_only)
+
+cat("\nLASSO only (n =", length(LASSO_only), "):\n")
+print(LASSO_only)
+
+cat("\nSVM only (n =", length(SVM_only), "):\n")
+print(SVM_only)
+
+cat("\n================ SHARED BETWEEN TWO METHODs ================\n")
+
+RF_LASSO  <- setdiff(intersect(selected_RF, selected_LASSO), selected_SVM)
+RF_SVM    <- setdiff(intersect(selected_RF, selected_SVM), selected_LASSO)
+LASSO_SVM <- setdiff(intersect(selected_LASSO, selected_SVM), selected_RF)
+
+cat("\nRF ∩ LASSO (excluding SVM) (n =", length(RF_LASSO), "):\n")
+print(RF_LASSO)
+
+cat("\nRF ∩ SVM (excluding LASSO) (n =", length(RF_SVM), "):\n")
+print(RF_SVM)
+
+cat("\nLASSO ∩ SVM (excluding RF) (n =", length(LASSO_SVM), "):\n")
+print(LASSO_SVM)
+
+# ML VALIDATION (SVM) for Top proteins
+set.seed(123)
+
+# Filter features from nselect present in data
+current_features <- intersect(nselect, colnames(final_data_ML))
+
+# Build DF
+df_nselect <- final_data_ML %>%
+  select(all_of(current_features), Visitcode)
+df_nselect$Visitcode <- factor(df_nselect$Visitcode, levels = c("VR","VD"))
+
+# Train/test split
+train_idx <- createDataPartition(df_nselect$Visitcode, p = 0.8, list = FALSE)
+train_df  <- df_nselect[train_idx, ]
+test_df   <- df_nselect[-train_idx, ]
+
+# Subtitle
+subtitle_nselect <- paste(current_features, collapse = ", ")
+
+
+# Train SVM
+model_nselect <- train(
+  Visitcode ~ ., data = train_df, method = "svmRadial",
+  trControl = trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = multiClassSummary)
+)
+
+# Confusion Matrices
+cm_train_ns <- confusionMatrix(predict(model_nselect, train_df), train_df$Visitcode)
+cm_test_ns  <- confusionMatrix(predict(model_nselect, test_df), test_df$Visitcode)
+ggsave(file.path(main_dir, "CM_Top10_Train.tiff"), plot = plot_cm(cm_train_ns, "Training CM (Top 10)", round(cm_train_ns$overall["Accuracy"], 3), subtitle = subtitle_nselect, palette = "train"), width = 7, height = 6)
+ggsave(file.path(main_dir, "CM_Top10_Test.tiff"), plot = plot_cm(cm_test_ns, "Test CM (Top 10)", round(cm_test_ns$overall["Accuracy"], 3), subtitle = subtitle_nselect, palette = "test"), width = 7, height = 6)
+
+# Plot Training CM
+plot_cm(cm_train_ns, "Training CM (Top proteins)")
+ 
+# Plot Test CM
+plot_cm(cm_test_ns, "Test CM (Top proteins)", 
+        round(cm_test_ns$overall["Accuracy"], 3), subtitle = subtitle_nselect, palette = "test")
+
+
+# FUNCTION DEFINITION 
+run_svm_bootstrap <- function(list_of_prots, data, n_boot = 1000) {
+  final_res <- data.frame()
+  
+  for (group_name in names(list_of_prots)) {
+    p <- list_of_prots[[group_name]]
+    if(length(p) == 0) next
+    
+    boot_aucs <- numeric(n_boot)
+    cat("Processing Group:", group_name, "\n")
+    
+    for (i in 1:n_boot) {
+# Sampling with replacement
+      idx <- sample(1:nrow(data), replace = TRUE)
+      train_set <- data[idx, ]
+      oob_idx <- setdiff(1:nrow(data), unique(idx))
+      test_set <- data[oob_idx, ]
+      
+      if(length(unique(test_set$Visitcode)) < 2) {
+        boot_aucs[i] <- NA
+        next
+      }
+      
+# SVM Radial Model
+      svm_fit <- e1071::svm(as.factor(Visitcode) ~ ., 
+                            data = train_set[, c(p, "Visitcode")], 
+                            kernel = "radial", 
+                            probability = TRUE)
+      
+# OOB Prediction
+      pred <- predict(svm_fit, test_set[, p], probability = TRUE)
+      probs <- attr(pred, "probabilities")
+      
+# Get probabilities for the target class (e.g., "VD")
+      pos_class <- levels(as.factor(data$Visitcode))[2]
+      prob_scores <- probs[, pos_class]
+      
+      boot_aucs[i] <- as.numeric(pROC::roc(test_set$Visitcode, prob_scores, quiet = TRUE)$auc)
+    }
+    
+    valid_aucs <- boot_aucs[!is.na(boot_aucs)]
+    final_res <- rbind(final_res, data.frame(
+      Group = group_name,
+      N = length(p),
+      Mean_OOB_AUC = round(mean(valid_aucs), 3),
+      SD_AUC = round(sd(valid_aucs), 3),
+      CI_Lower = round(quantile(valid_aucs, 0.025), 3),
+      CI_Upper = round(quantile(valid_aucs, 0.975), 3),
+      Proteins = paste(sort(p), collapse = ", ")
+    ))
+  }
+  return(final_res)
+}
+
+
+# Initial Setup - Define Core and Candidates
+core <- common_three 
+
+# Collect ALL proteins from all models that are NOT in the core
+# This includes RF_SVM, RF_only, SVM_only, etc.
+all_selected_prots <- unique(c(selected_RF, selected_LASSO, selected_SVM))
+candidates_to_test <- setdiff(all_selected_prots, core)
+
+cat("Core proteins:", paste(core, collapse=", "), "\n")
+cat("Candidates for 5+1 screening:", paste(candidates_to_test, collapse=", "), "\n")
+
+# Step 1: Calculating Baseline for Core (OOB)
+cat("\n--- Step 1: Calculating Baseline for Core (n=5) ---\n")
+core_boot_res <- run_svm_bootstrap(list(Core_Only = core), final_data_ML_scaled, n_boot = 1000)
+base_auc <- core_boot_res$Mean_OOB_AUC
+cat("Baseline AUC (Core Only):", base_auc, "\n")
+
+# Step 2: Phase 1 - Screening (Core + 1)
+
+cat("\n--- Step 2: Phase 1 - Screening (Each Candidate + Core) ---\n")
+screening_list <- list()
+for(prot in candidates_to_test) {
+  screening_list[[prot]] <- unique(c(core, prot))
+}
+
+# Run Bootstrap for all 5+1 combinations
+phase1_results <- run_svm_bootstrap(screening_list, final_data_ML_scaled, n_boot = 1000)
+
+# Combine with baseline and sort
+phase1_output <- rbind(core_boot_res, phase1_results) %>% arrange(desc(Mean_OOB_AUC))
+
+# SAVE PHASE 1 RESULTS
+write_xlsx(phase1_output, "Phase1_Screening_Results.xlsx")
+print(head(phase1_output, 10))
+
+# Step 3: Filter Winners & Build Final Combinations
+
+# Identify proteins that strictly increased the AUC
+winners <- phase1_output %>% 
+  filter(Mean_OOB_AUC > base_auc & Group != "Core_Only") %>% 
+  pull(Group)
+
+cat("\nWinners that improved the Core:", paste(winners, collapse=", "), "\n")
+
+# Build all subsets from winners + Core
+final_combos <- list(Core_Only = core)
+if(length(winners) > 0) {
+  for(i in 1:length(winners)) {
+    cmb <- combn(winners, i, simplify = FALSE)
+    for(j in seq_along(cmb)) {
+      name <- paste0("Core_plus_", i, "_selected_", j)
+      final_combos[[name]] <- unique(c(core, cmb[[j]]))
+    }
+  }
+}
+
+
+# Step 4: Phase 2 - Final Evaluation
+
+cat("\n--- Step 4: Phase 2 - Evaluating Winning Combinations ---\n")
+set.seed(123)
+phase2_results <- run_svm_bootstrap(final_combos, final_data_ML_scaled, n_boot = 1000)
+
+# Sort and save
+phase2_results <- phase2_results %>% arrange(desc(Mean_OOB_AUC))
+write_xlsx(phase2_results, "Phase2_Final_Combinations_Results.xlsx")
+
+# Display Top 10
+print(head(phase2_results, 10))
+
+# Joining to table together
+
+final_report_ordered <- bind_rows(
+  phase1_output %>% mutate(Phase = "Phase 1"),
+  phase2_results %>% mutate(Phase = "Phase 2") 
+) %>% 
+  distinct(Proteins, .keep_all = TRUE) 
+
+
+final_report_clean <- final_report_ordered %>%
+  rowwise() %>%
+  mutate(
+    Proteins = {
+      prots <- unlist(strsplit(Proteins, ", "))
+      prots_final <- ifelse(prots %in% core, paste0("[", prots, "]"), prots)
+      paste(sort(prots_final), collapse = ", ")
+    }
+  ) %>%
+  #Coloumn selection
+  select(Phase, Group, N, Mean_OOB_AUC, Proteins) %>%
+  arrange(Phase, desc(Mean_OOB_AUC))
+
+write_xlsx(final_report_clean, file.path(main_dir, "Bootstrap_final_result.xlsx"))
+
+
+#Boxplot of 10 Specified Proteins
+# Define the 10 specific proteins
+top10_features_VC <- c("ADGRG1", "CCL17", "CD5", "CD27", "CXCL9", 
+                       "CXCL11", "FASLG", "GZMA", "KYNU", "TNFRSF9")
+
+# Select specified proteins plus the grouping column ('Visitcode') from full dataset
+plot_data_imp_groups_VC <- final_data_ML %>%
+  select(all_of(c(top10_features_VC, "Visitcode"))) %>% 
+  pivot_longer(cols = all_of(top10_features_VC), names_to = "Protein", values_to = "Expression")
+
+# Plot boxplots + jitter faceted by protein
+p_imp_groups_VC <- ggplot(plot_data_imp_groups_VC, aes(x = Visitcode, y = Expression, fill = Visitcode)) +
+  geom_boxplot(width = 0.8, alpha = 0.8, color = "black", outlier.size = 0.5) +
+  geom_jitter(width = 0.1, size = 0.5, alpha = 0.8) +
+  facet_wrap(~Protein, ncol = 5, scales = "free_y") +
+  scale_fill_manual(values = c("VD" = "#ff704d", "VR" = "#668cff")) +
+  theme_bw() +
+  labs(
+    title = " bootstrap selected proteins",
+    y = "Protein abundant (NPX)",
+    x = "Groups",
+    fill = "Groups"
+  ) +
+  theme(
+    axis.text = element_text(color = "black", size = 16), 
+    axis.title = element_text(color = "black", size = 16),
+    
+    # PROTEIN NAME SETTING
+    strip.background = element_rect(fill = "white", color = "black", size = 1),
+    strip.text = element_text(size = 15, face = "plain", color = "black"),
+    plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+    # total font and gard
+    text = element_text(family = "Arial"),
+    panel.border = element_rect(color = "black", fill = NA, size = 1), 
+    
+    # eleminate grids line
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    
+    legend.position = "none"
+  )
+# Show plot
+print(p_imp_groups_VC)
+
+# Save  Boxplots
+ggsave(filename = file.path(main_dir, "bootstrap_Boxplots.png"), 
+       plot = p_imp_groups_VC, width = 15, height = 10, dpi = 300)
+
+#Heatmap of 10 Specified Proteins
+# Prepare heatmap data for the 10 specified proteins
+top10_heatmap_data_VC <- final_data_ML[, top10_features_VC, drop = FALSE]
+group_vec_VC <- final_data_ML$Visitcode
+
+# Order samples by group
+order_idx_VC <- order(group_vec_VC)
+top10_heatmap_data_VC <- top10_heatmap_data_VC[order_idx_VC, ]
+group_ordered_VC <- group_vec_VC[order_idx_VC]
+
+# Transpose: proteins as rows, samples as columns
+top10_heatmap_data_VC <- t(as.matrix(top10_heatmap_data_VC))
+# Using PatientID for column names as per original code
+colnames(top10_heatmap_data_VC) <- final_data_ML$PatientID[order_idx_VC]
+
+# Define colors for groups
+group_colors <- c("VD" = "#ff704d", "VR" = "#668cff")
+
+# Create column annotation
+annotation_col_VC <- HeatmapAnnotation(
+  Groups = group_ordered_VC,
+  col = list(Groups = group_colors),
+  annotation_name_side = "right",
+  annotation_legend_param = list(
+    Groups = list(title = "Groups", title_gp = gpar(fontsize = 18, fontface = "plain"))
+  )
+)
+
+# Draw heatmap with original visual settings
+ht_VC <- Heatmap(
+  top10_heatmap_data_VC,
+  name = "NPX",
+  top_annotation = annotation_col_VC,
+  cluster_columns = FALSE,
+  show_column_names = TRUE,
+  column_names_rot = 90,
+  column_names_gp = gpar(fontsize = 8),
+  row_names_gp = gpar(fontsize = 20),
+  column_title = "bootstrap selected proteins",
+  column_title_gp = gpar(fontsize = 18, fontface = "bold"),
+  heatmap_legend_param = list(
+    title_gp = gpar(fontsize = 18, fontface = "plain") 
+  )
+)
+
+# Show Heatmap
+draw(ht_VC, heatmap_legend_side = "right", annotation_legend_side = "right")
+
+# Save Heatmap
+tiff(file.path(main_dir, "bootstrao_heatmap.tiff"), width = 1200, height = 1000, res = 120)
+draw(ht_VC, heatmap_legend_side = "right", annotation_legend_side = "right")
+dev.off()
+
+
+#==========================================================ML for CNS1 and CNS2+3 in VD =============================================================
+
+
+set.seed(12345)
+final_data_3 <- read_excel("Final_data_3.xlsx")
+
+# Update DT values
+final_data_3$DiseaseType[final_data_3$DiseaseType == "T-ALL"] <- 1
+final_data_3$DiseaseType[final_data_3$DiseaseType == "B-ALL"] <- 2
+final_data_3$DiseaseType <- as.numeric(as.character(final_data_3$DiseaseType))
+
+# Update Gender values
+final_data_3$Gender[final_data_3$Gender == "F"] <- 1
+final_data_3$Gender[final_data_3$Gender == "M"] <- 2
+final_data_3$Gender <- as.numeric(as.character(final_data_3$Gender))
+
+# CREATE NEW TARGET VARIABLE (CNS 1 VS CNS 2+3) & FILTER BY VISIT
+
+# Clean extra spaces and convert everything to real NA
+final_data_3$Group_CNS_Involvement <- trimws(as.character(final_data_3$Group_CNS_Involvement))
+final_data_3$Group_CNS_Involvement[final_data_3$Group_CNS_Involvement == "NA"] <- NA
+
+# Delete rows where CNS group is missing
+final_data_ML <- final_data_3[!is.na(final_data_3$Group_CNS_Involvement) & final_data_3$Group_CNS_Involvement != "", ]
+
+# STRICTLY KEEP ONLY DIAGNOSIS SAMPLES (VD) TO AVOID DATA LEAKAGE
+final_data_ML <- final_data_ML %>% filter(Visitcode == "VD")
+
+# Create the new binary target variable for CNS classification
+final_data_ML <- final_data_ML %>%
+  mutate(CNS_Target = case_when(
+    Group_CNS_Involvement == "1" ~ "CNS_1",
+    Group_CNS_Involvement %in% c("2", "3") ~ "CNS_2_3",
+    TRUE ~ NA_character_
+  ))
+
+final_data_ML$CNS_Target <- as.factor(final_data_ML$CNS_Target)
+
+# Fix non-numeric columns if any leftover
+cols_to_fix <- c("DiseaseType", "Gender", "Group_CNS_Involvement")
+for(col in cols_to_fix) {
+  final_data_ML[[col]] <- as.numeric(as.character(final_data_ML[[col]]))
+}
+
+#*********************
+# DIRECTORIES SETUP
+#*********************
+main_dir <- "MachineLearning_CNS"
+dir.create(main_dir, showWarnings = FALSE)
+
+rf_dir    <- file.path(main_dir, "RF")
+lasso_dir <- file.path(main_dir, "LASSO")
+svm_dir   <- file.path(main_dir, "SVM")
+
+dir.create(rf_dir, showWarnings = FALSE)
+dir.create(lasso_dir, showWarnings = FALSE)
+dir.create(svm_dir, showWarnings = FALSE)
+
+# Define metadata columns
+metadata_cols <- c("WellID", "PatientID", "Visit", "Visitcode", "CNS_Involvement", "Group_CNS_Involvement", "CNS_Target")
+assay_cols <- names(final_data_ML)[!names(final_data_ML) %in% metadata_cols]
+
+#Confusion Matrix Plot Custom Function
+while (!is.null(dev.list())) dev.off()
+
+plot_cm <- function(cm, title, acc, subtitle = "", palette = "train") {
+  m <- as.data.frame(cm$table)
+  colnames(m) <- c("Predicted","True","Freq")
+  ggplot(m, aes(Predicted, True, fill = Freq)) +
+    geom_tile(color = "white", linewidth = 1.2) +
+    geom_text(aes(label = Freq), color = "black", size = 10, fontface = "bold") +
+    scale_fill_gradient(low = "#e8f5e9", high = "#2e7d32", guide = guide_colourbar(barheight = unit(30, "lines"), barwidth = unit(1, "lines"), ticks.colour = "black", frame.colour = "black")) +
+    labs(title = paste0(title, " (Accuracy = ", acc, ")"), subtitle = subtitle, x = "Predicted label", y = "True label", fill = NULL) +
+    theme_minimal(base_size = 24) + theme(plot.title = element_text(size = 24, face = "bold"), plot.subtitle = element_text(size = 12, face = "italic", color = "gray20"), axis.text = element_text(size = 22), legend.title = element_blank(), legend.text = element_text(size = 20))
+}
+
+
+#*********************
+#   Random Forest       
+#*********************
+
+rf_data_CNS <- na.omit(final_data_ML)
+cols_to_keep_CNS <- c("CNS_Target", assay_cols)
+rf_data_CNS <- rf_data_CNS[, cols_to_keep_CNS]
+
+set.seed(123)
+rf_model_CNS <- randomForest(CNS_Target ~ ., data = rf_data_CNS, importance = TRUE)
+
+imp_CNS <- importance(rf_model_CNS)
+imp_CNS_df <- data.frame(Protein = rownames(imp_CNS), MeanDecreaseGini = imp_CNS[, "MeanDecreaseGini"])
+imp_CNS_df <- imp_CNS_df[order(-imp_CNS_df$MeanDecreaseGini), ]
+
+imp_CNS_df_top30 <- imp_CNS_df[1:30, ] %>%
+  rownames_to_column("Feature") %>%
+  arrange(desc(MeanDecreaseGini))
+
+size_breaks <- c(-Inf, 0.60, 0.90, 1.20, 1.50, Inf)
+size_labels <- c("≤0.60", "0.60–0.90", "0.90–1.20", "1.20–1.50", "≥1.50")
+size_map    <- c("≤0.60" = 2, "0.60–0.90" = 4, "0.90–1.20" = 6, "1.20–1.50" = 8, "≥1.50" = 10)
+
+imp_CNS_df_top30$SizeBin <- cut(imp_CNS_df_top30$MeanDecreaseGini, breaks = size_breaks, labels = size_labels, right = TRUE, include.lowest = TRUE)
+
+p <- ggplot(imp_CNS_df_top30, aes(x = MeanDecreaseGini, y = reorder(Feature, MeanDecreaseGini))) +
+  geom_point(aes(size = SizeBin), color = "#1271c9") +
+  scale_size_manual(name = "Avg. MDGini", values = size_map, guide = guide_legend(override.aes = list(color = "#1271c9"))) +
+  theme_light() + theme(
+    axis.text.y = element_text(color = "black", size = 10),
+    axis.text.x = element_text(color = "black", size = 10),
+    axis.title = element_text(size = 12),
+    legend.text = element_text(color = "black", size = 12),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )+xlab("Average MDGini") +
+  ylab("Proteins") +
+  ggtitle("Top 30 important features_RF")
+print(p)
+ggsave(filename = file.path(rf_dir, "RF_Top30_Importance.tiff"), plot = p, width = 10, height = 8, dpi = 300)
+write.csv(imp_CNS_df, file = file.path(rf_dir, "RF_Full_Importance.csv"), row.names = FALSE)
+write.csv(imp_CNS_df_top30, file = file.path(rf_dir, "RF_Top30_Importance.csv"), row.names = FALSE)
+
+#RF-ROC
+rf_data_roc <- final_data_ML
+set.seed(123)
+train_idx <- createDataPartition(rf_data_roc$CNS_Target, p = 0.8, list = FALSE)
+train_data_CNS <- rf_data_roc[train_idx, ]
+test_data_CNS  <- rf_data_roc[-train_idx, ]
+
+train_subset <- na.roughfix(train_data_CNS[, c("CNS_Target", assay_cols)])
+test_subset  <- na.roughfix(test_data_CNS[, c("CNS_Target", assay_cols)])
+
+set.seed(123)
+rf_model_ROC <- randomForest(CNS_Target ~ ., data = train_subset, importance = TRUE)
+pred_probs_CNS <- predict(rf_model_ROC, newdata = test_subset, type = "prob")
+
+target_class <- "CNS_2_3"
+roc_obj <- roc(test_subset$CNS_Target == target_class, pred_probs_CNS[, target_class])
+auc_val <- auc(roc_obj)
+
+roc_df <- data.frame(fpr = 1 - roc_obj$specificities, tpr = roc_obj$sensitivities)
+p_roc <- ggplot(roc_df, aes(x = fpr, y = tpr)) +
+  geom_line(color = "#1271c9", linewidth = 1.2) + geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray") +
+  annotate("text", x = 0.6, y = 0.2, label = paste0("AUC = ", round(auc_val, 3)), size = 6, fontface = "bold") +
+  labs(title = paste("ROC Curve (80/20 Split) -", target_class), x = "False Positive Rate (1 - Specificity)", y = "True Positive Rate (Sensitivity)") +
+  theme_light()+
+  theme(
+    axis.text.y = element_text(color = "black", size = 10),
+    axis.text.x = element_text(color = "black", size = 10),
+    axis.title = element_text(size = 12),
+    legend.text = element_text(color = "black", size = 12),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )
+
+
+print(p_roc)
+ggsave(filename = file.path(rf_dir, "RF_ROC_Curve.png"), plot = p_roc, width = 8, height = 6, dpi = 300)
+
+# RF 5-Fold Cross Validation 
+set.seed(1234)
+top_features <- imp_CNS_df_top30$Feature
+target_col_cns <- "CNS_Target"
+df_cv_cns <- rf_data_CNS[, c(target_col_cns, top_features)]
+
+k <- 5
+n <- nrow(df_cv_cns)
+folds <- integer(n)
+cls <- df_cv_cns[[target_col_cns]]
+
+for (lev in levels(cls)) {
+  idx <- which(cls == lev)
+  idx <- sample(idx, length(idx), replace = FALSE)
+  grp_ids <- rep(1:k, length.out = length(idx))
+  folds[idx] <- grp_ids
+}
+
+feat_names <- setdiff(colnames(df_cv_cns), target_col_cns)
+cv_models_cns <- vector("list", k)
+cv_acc_cns <- numeric(k)
+cv_conf_cns <- vector("list", k)
+names(cv_models_cns) <- names(cv_acc_cns) <- names(cv_conf_cns) <- paste0("Fold", 1:k)
+cv_import_cns <- matrix(NA_real_, nrow = length(feat_names), ncol = k, dimnames = list(feat_names, paste0("Fold", 1:k)))
+
+for (i in 1:k) {
+  train_i <- df_cv_cns[folds != i, ] 
+  test_i  <- df_cv_cns[folds == i, ]
+  rf_i <- randomForest(as.formula(paste(target_col_cns, "~ .")), data = train_i, importance = TRUE)
+  pred_i <- predict(rf_i, newdata = test_i)
+  acc_i <- mean(pred_i == test_i[[target_col_cns]])
+  
+  run_name <- paste0("Fold", i)
+  cv_models_cns[[run_name]] <- rf_i
+  cv_acc_cns[run_name] <- acc_i
+  cv_conf_cns[run_name] <- list(table(Truth = test_i[[target_col_cns]], Pred = pred_i))
+  
+  if (!is.null(rf_i$importance)) {
+    common_feats <- intersect(feat_names, rownames(rf_i$importance))
+    cv_import_cns[common_feats, run_name] <- rf_i$importance[common_feats, "MeanDecreaseGini"]
+  }
+}
+
+cv_res_df <- data.frame(Fold = names(cv_acc_cns), Accuracy = as.numeric(cv_acc_cns))
+cv_res_df <- rbind(cv_res_df, data.frame(Fold = "Average", Accuracy = mean(cv_acc_cns)))
+write.csv(cv_res_df, file = file.path(rf_dir, "RF_CV_Accuracy.csv"), row.names = FALSE)
+
+sink(file.path(rf_dir, "RF_CV_Confusion_Matrices.txt"))
+print(cv_conf_cns)
+sink()
+
+write.csv(cv_import_cns, file = file.path(rf_dir, "RF_CV_Importance_Per_Fold.csv"))
+saveRDS(rf_model_CNS, file = file.path(rf_dir, "final_rf_model.rds"))
+
+agg_conf_cns <- Reduce(`+`, cv_conf_cns)
+mean_imp_cv_cns <- sort(rowMeans(cv_import_cns, na.rm = TRUE), decreasing = TRUE)
+
+write.csv(as.data.frame.matrix(agg_conf_cns), file = file.path(rf_dir, "RF_CV_Aggregated_Confusion_Matrix.csv"))
+
+cm_cv_aggregated <- list(table = as.table(agg_conf_cns))
+cv_total_acc <- round(sum(diag(agg_conf_cns)) / sum(agg_conf_cns), 3)
+
+p_cm_cv <- plot_cm(
+  cm = cm_cv_aggregated, 
+  title = "RF_ Aggregated CV Confusion Matrix", 
+  acc = cv_total_acc, 
+  palette = "train" 
+)
+print(p_cm_cv)
+
+tiff(file.path(rf_dir, "CM_Validation.tiff"), width = 10, height = 8, units = "in", res = 300, compression = "lzw")
+print(p_cm_cv)
+dev.off()
+
+# Top 10 Visualizations
+top_n_CNS <- 10
+top10_selected_RF_CNS <- imp_CNS_df %>% slice(1:top_n_CNS) %>% rownames_to_column("Feature") %>% arrange(desc(MeanDecreaseGini))
+top10_selected_RF_CNS <- top10_selected_RF_CNS %>% mutate(SizeBin = cut(MeanDecreaseGini, breaks = size_breaks, labels = size_labels, right = TRUE, include.lowest = TRUE))
+
+p_top10_CNS <- ggplot(top10_selected_RF_CNS, aes(x = MeanDecreaseGini, y = reorder(Feature, MeanDecreaseGini))) +
+  geom_point(aes(size = SizeBin), color = "#1271c9") +
+  scale_size_manual(name = "Avg. MDGini", values = size_map, drop = FALSE, guide = guide_legend(override.aes = list(color = "#1271c9"))) +
+  theme_light() +
+  theme(
+    axis.text.y = element_text(color = "black", size = 18),
+    axis.text.x = element_text(color = "black", size = 18),
+    axis.title = element_text(size = 18),
+    legend.text = element_text(color = "black", size = 18),
+    panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA),
+    plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )+xlab("Average MDGini") +
+  ylab("Proteins") +
+  ggtitle("Top important proteins_RF_VD")
+print(p_top10_CNS)
+ggsave(filename = file.path(rf_dir, "RF_top10_CNS.tiff"), plot = p_top10_CNS, width = 15, height = 10, dpi = 300)
+
+# Boxplots RF
+top10_features_CNS <- top10_selected_RF_CNS$Feature
+plot_data_imp_groups_RF_CNS <- final_data_ML %>%
+  select(all_of(c(top10_features_CNS, "CNS_Target"))) %>% 
+  pivot_longer(cols = all_of(top10_features_CNS), names_to = "Protein", values_to = "Expression")
+
+p_imp_groups_RF_CNS <- ggplot(plot_data_imp_groups_RF_CNS, aes(x = CNS_Target, y = Expression, fill = CNS_Target)) +
+  geom_boxplot(width = 0.8, alpha = 0.8, color = "black", outlier.size = 0.5) +
+  geom_jitter(width = 0.1, size = 0.5, alpha = 0.8) +
+  facet_wrap(~Protein, ncol = 5, scales = "free_y") +
+  scale_fill_manual(values = c("CNS_1" = "#ff704d", "CNS_2_3" = "#668cff")) +
+  theme_bw() + labs(title = "Top 10 Features Differentiating CNS Groups_RF", y = "Protein abundance (NPX)", x = "Groups", fill = "Groups") +
+  theme(
+    axis.text = element_text(color = "black", size = 16), 
+    axis.title = element_text(color = "black", size = 16),
+    
+    # PROTEIN NAME SETTING
+    strip.background = element_rect(fill = "white", color = "black", size = 1),
+    strip.text = element_text(size = 18, face = "plain", color = "black"),
+    plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+    # total font and gard
+    text = element_text(family = "Arial"),
+    panel.border = element_rect(color = "black", fill = NA, size = 1), 
+    
+    # eleminate grids line
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    
+    legend.position = "none"
+  )
+print(p_imp_groups_RF_CNS)
+ggsave(filename = file.path(rf_dir, "RF_Top10_Boxplots.png"), plot =  p_imp_groups_RF_CNS, width = 15, height = 10, dpi = 300)
+
+# Heatmap RF
+top10_heatmap_data_CNS <- final_data_ML[, top10_features_CNS, drop = FALSE]
+group_vec_CNS <- final_data_ML$CNS_Target
+order_idx_CNS <- order(group_vec_CNS)
+
+top10_heatmap_data_CNS <- t(as.matrix(top10_heatmap_data_CNS[order_idx_CNS, ]))
+colnames(top10_heatmap_data_CNS) <- final_data_ML$PatientID[order_idx_CNS]
+group_ordered_CNS <- group_vec_CNS[order_idx_CNS]
+
+group_colors <- c("CNS_1" = "#ff704d", "CNS_2_3" = "#668cff")
+annotation_col_CNS <- HeatmapAnnotation(Groups = group_ordered_CNS, col = list(Groups = group_colors), annotation_name_side = "right", annotation_legend_param = list(Groups = list(title = "Groups", title_gp = gpar(fontsize = 18, fontface = "plain"))))
+
+ht_CNS <- Heatmap(
+  top10_heatmap_data_CNS,
+  name = "NPX",
+  top_annotation = annotation_col_CNS,
+  cluster_columns = FALSE,
+  show_column_names = TRUE,
+  column_names_rot = 90,
+  column_names_gp = gpar(fontsize = 6),
+  row_names_gp = gpar(fontsize = 14),
+  column_title = "Important features selected by RF (Top 10)_Visitcode",
+  column_title_gp = gpar(fontsize = 14, fontface = "bold"),
+  heatmap_legend_param = list(
+    title_gp = gpar(fontsize = 14, fontface = "plain") # NPX legend title non-bold
+  )
+)
+draw(ht_CNS, heatmap_legend_side = "right", annotation_legend_side = "right")
+tiff(file.path(rf_dir, "RF_Heatmap_Top10.tiff"), width = 1200, height = 1000, res = 120)
+draw(ht_CNS, heatmap_legend_side = "right", annotation_legend_side = "right")
+dev.off()
+
+
+
+
+#*********************
+#      LASSO     
+#*********************
+
+final_data_ML <- final_data_ML %>% na.omit(subset = assay_cols)
+
+# Scaling
+scaled_assays <- final_data_ML %>% select(-all_of(metadata_cols)) %>% as.data.frame() %>% scale() %>% as.data.frame()
+scaled_assays$CNS_Target <- final_data_ML$CNS_Target
+final_data_ML_scaled <- scaled_assays
+
+y_lasso <- as.factor(final_data_ML_scaled$CNS_Target)
+x_lasso <- as.matrix(final_data_ML_scaled[, colnames(final_data_ML_scaled) != "CNS_Target"])
+
+set.seed(123)
+cvfit_CNS <- cv.glmnet(x_lasso, y_lasso, family = "binomial", type.measure = "class", nfolds = 10)
+
+tiff(filename = file.path(lasso_dir, "cvfit_CNS.tiff"), width = 10, height = 8, units = "in", res = 300)
+plot(cvfit_CNS)
+dev.off()
+
+lambda_1se <- cvfit_CNS$lambda.1se
+coefs_CNS <- coef(cvfit_CNS, s = lambda_1se)
+
+lasso_selected_proteins_CNS <- rownames(coefs_CNS)[which(coefs_CNS != 0)]
+lasso_selected_proteins_CNS <- setdiff(lasso_selected_proteins_CNS, "(Intercept)")
+
+write.csv(lasso_selected_proteins_CNS, file = file.path(lasso_dir, "LASSO_Selected_Proteins.csv"), row.names = FALSE)
+
+# Safe check - Only generate plots and confusion matrix if LASSO selected at least one protein
+if (length(lasso_selected_proteins_CNS) > 0) {
+  
+  coef_df_CNS <- data.frame(Proteins = rownames(coefs_CNS), Coefficient = as.numeric(coefs_CNS[,1]), stringsAsFactors = FALSE) %>% 
+    filter(Proteins != "(Intercept)", Coefficient != 0)
+  
+# Coefficients Plot
+  coef_df_selected_CNS <- coef_df_CNS %>%
+    mutate(Feature = Proteins, Value = Coefficient, StrengthBin = cut(abs(Coefficient), breaks = c(-Inf, 0.05, 0.10, 0.15, Inf), labels = c("< 0.05", "0.05–0.10", "0.10–0.15", "> 0.15"), right = TRUE))
+  
+  p_lasso_coef_CNS <- ggplot(coef_df_selected_CNS, aes(x = Value, y = reorder(Feature, Value))) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_point(color = "#1271c9", aes(size = StrengthBin), alpha = 0.95) +
+    theme_light() + theme_light() +
+    xlab("Coefficient") +
+    ylab("Proteins") +
+    ggtitle("LASSO selected proteins coefficients at lambda.1se") +
+    theme(
+      axis.text.y = element_text(color = "black", size = 10),
+      axis.text.x = element_text(color = "black", size = 10),
+      axis.title = element_text(size = 12),
+      legend.text = element_text(color = "black", size = 12, hjust = 0.5),
+      legend.box.just = "center",      
+      legend.title = element_text(hjust = 0.5, size = 11, face = "bold"), 
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(color = "black", fill = NA),
+      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+      legend.position = "right",
+    )
+  
+  print(p_lasso_coef_CNS)
+  ggsave(filename = file.path(lasso_dir, "p_lasso_coef_CNS_pointdesign.tiff"), plot = p_lasso_coef_CNS, width = 10, height = 8, dpi = 300)
+  
+# Boxplots Lasso
+  plot_data_lasso_groups_CNS <- final_data_ML %>%
+    select(all_of(c(lasso_selected_proteins_CNS, "CNS_Target"))) %>%
+    pivot_longer(cols = all_of(lasso_selected_proteins_CNS), names_to = "Protein", values_to = "Expression")
+  
+  p_lasso_groups_CNS <- ggplot(plot_data_lasso_groups_CNS, aes(x = CNS_Target, y = Expression, fill = CNS_Target)) +
+    geom_boxplot(width = 0.8, alpha = 0.8, color = "black", outlier.size = 0.5) + geom_jitter(width = 0.2, size = 0.5, alpha = 0.8) +
+    facet_wrap(~Protein, ncol = 5, scales = "free_y") + scale_fill_manual(values = c("CNS_1" = "#ff704d", "CNS_2_3" = "#668cff")) +
+    theme_bw() + labs(title = "Lasso-Selected Proteins Expression by CNS Groups", y = "Protein Expression (NPX)", x = "Groups", fill = "Groups") +
+    theme(
+      axis.text = element_text(color = "black", size = 16), 
+      axis.title = element_text(color = "black", size = 16),
+      
+# PROTEIN NAME SETTING
+      strip.background = element_rect(fill = "white", color = "black", size = 1),
+      strip.text = element_text(size = 18, face = "plain", color = "black"),
+      plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+# Total font and gard
+      text = element_text(family = "Arial"),
+      panel.border = element_rect(color = "black", fill = NA, size = 1), 
+      
+# Eleminate grids line
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      
+      legend.position = "none"
+    )  
+  print(p_lasso_groups_CNS)
+  ggsave(filename = file.path(lasso_dir, "p_lasso_groups_CNS.tiff"), plot = p_lasso_groups_CNS, width = 10, height = 8, dpi = 300)
+  
+# Lasso Confusion Matrix
+  lasso_preds <- predict(cvfit_CNS, newx = x_lasso, s = "lambda.1se", type = "class")
+  lasso_conf_matrix <- table(Predicted = as.factor(lasso_preds), Actual = y_lasso)
+  lasso_acc_round <- round(sum(diag(lasso_conf_matrix)) / sum(lasso_conf_matrix), 3)
+  
+  p_cm_lasso <- plot_cm(cm = list(table = as.table(lasso_conf_matrix)), title = "LASSO Confusion Matrix", acc = lasso_acc_round, subtitle = paste("Based on", length(lasso_selected_proteins_CNS), "selected proteins"))
+  print(p_cm_lasso)
+  ggsave(filename = file.path(lasso_dir, "LASSO_CM_Validation.tiff"), plot = p_cm_lasso, width = 8, height = 8, dpi = 300)
+  
+} else {
+#  If no features selected, log a message and skip plotting to avoid errors
+  cat("Notice: LASSO under 1se criteria shrunk all coefficients to zero. Skipping coefficient/boxplot plots.\n")
+}
+
+#*********************
+#       SVM
+#*********************
+
+# Prepare Data for SVM using CNS_Target
+metadata_cols_svm <- c("WellID", "PatientID", "Visit", "Visitcode", "CNS_Involvement", "Group_CNS_Involvement", "CNS_Target")
+actual_features <- setdiff(colnames(final_data_ML_scaled), metadata_cols_svm)
+
+y_svm <- as.factor(final_data_ML$CNS_Target)
+x_svm <- as.matrix(final_data_ML_scaled[rownames(final_data_ML), actual_features])
+storage.mode(x_svm) <- "numeric"
+
+#BASIC SVM (RADIAL)
+set.seed(123)
+tuned_svm <- tune.svm(
+  x_svm, y_svm,
+  kernel = "radial",
+  cost = c(0.1, 1, 10, 100),  
+  gamma = c(0.001, 0.01, 0.1, 1) 
+)
+
+best_svm_model <- tuned_svm$best.model
+saveRDS(best_svm_model, file = file.path(svm_dir, "best_svm_model.rds"))
+
+pred_CNS_svm <- predict(best_svm_model, x_svm)
+svm_acc <- mean(pred_CNS_svm == y_svm)
+
+# Plot Basic SVM Confusion Matrix
+p_cm_svm_radial <- plot_cm(
+  cm = list(table = as.table(table(Predicted = pred_CNS_svm, Actual = y_svm))), 
+  title = "SVM Radial Confusion Matrix", 
+  acc = round(svm_acc, 3), 
+  subtitle = "Based on all available proteins", 
+  palette = "train" 
+) + 
+  scale_fill_gradient(low = "#e8f5e9", high = "#2e7d32", 
+                      guide = guide_colourbar(barheight = unit(30, "lines"), barwidth = unit(1, "lines")))
+
+print(p_cm_svm_radial)
+ggsave(filename = file.path(svm_dir, "SVM_Radial_CM_Final.tiff"), plot = p_cm_svm_radial, 
+       width = 8, height = 8, dpi = 300, compression = "lzw")
+
+#CARET SVM (WITH CV) 
+levels(y_svm) <- make.names(levels(y_svm)) 
+
+set.seed(123)
+train_control_CNS <- trainControl(method = "cv", number = 5, classProbs = TRUE, savePredictions = "final")
+svm_fit_CNS <- train(x = x_svm, y = y_svm, method = "svmRadial", trControl = train_control_CNS, tuneLength = 5)
+
+# Save Tuning Plot
+while (!is.null(dev.list())) dev.off()
+tiff(filename = file.path(svm_dir, "SVM_Tuning_Results.tiff"), 
+     width = 10, height = 8, units = "in", res = 300)
+print(plot(svm_fit_CNS, 
+           main = "Grid Search Results for SVM Radial Model (Accuracy vs Parameters)",
+           sub = "Cross-Validation Accuracy across different Sigma and Cost values"))
+dev.off()
+
+#FEATURE SELECTION (RFE) 
+set.seed(123)
+rfe_control_CNS <- rfeControl(functions = caretFuncs, method = "cv", number = 5)
+
+svm_profile_CNS <- rfe(
+  x = x_svm, y = y_svm,
+  sizes = seq(5, ncol(x_svm), 5),
+  rfeControl = rfe_control_CNS,
+  method = "svmRadial",   
+  tuneLength = 3
+)
+
+print(svm_profile_CNS)
+capture.output(print(svm_profile_CNS), file = file.path(svm_dir, "SVM_RFE_Report.txt"))
+
+#  EVALUATE RFE RESULTS
+rfe_preds <- predict(svm_profile_CNS, x_svm)
+rfe_acc <- mean(rfe_preds == y_svm)
+
+p_cm_rfe <- plot_cm(
+  cm = list(table = as.table(table(Predicted = rfe_preds, Actual = y_svm))), 
+  title = "SVM-RFE Optimized Confusion Matrix", 
+  acc = round(rfe_acc, 3), 
+  subtitle = paste("Based on the top", svm_profile_CNS$optsize, "selected proteins"), 
+  palette = "train" 
+) + 
+  scale_fill_gradient(low = "#e8f5e9", high = "#2e7d32", 
+                      guide = guide_colourbar(barheight = unit(30, "lines"), barwidth = unit(1, "lines")))
+
+print(p_cm_rfe)
+ggsave(filename = file.path(svm_dir, "SVM_RFE_Final_CM.tiff"), plot = p_cm_rfe, 
+       width = 8, height = 8, dpi = 300, compression = "lzw")
+
+#Retrain model using selected features from RFE
+selected_features <- predictors(svm_profile_CNS)
+cat("Number of selected features:", length(selected_features), "\n")
+
+x_selected <- x_svm[, selected_features, drop = FALSE]
+
+set.seed(123)
+svm_fit_selected <- train(
+  x = x_selected,
+  y = y_svm,
+  method = "svmRadial",
+  trControl = train_control_CNS,
+  tuneLength = 5
+)
+
+print(svm_fit_selected)
+write.csv(svm_fit_selected$bestTune, file = file.path(svm_dir, "SVM_Best_Parameters_Final.csv"), row.names = FALSE)
+
+svm_importance <- varImp(svm_fit_selected, scale = FALSE)
+write.csv(svm_importance$importance, file = file.path(svm_dir, "SVM_Feature_Importance.csv"))
+
+# check sizes
+cat("Number of rows (samples):", nrow(x_svm), "\n")
+cat("Number of columns (features):", ncol(x_svm), "\n")
+
+rfe_sizes <- seq(5, ncol(x_svm), 5) 
+write.csv(data.frame(RFE_Tested_Sizes = rfe_sizes), file = file.path(svm_dir, "RFE_Tested_Sizes.csv"), row.names = FALSE)
+
+x_df_CNS <- as.data.frame(x_svm) 
+colnames(x_df_CNS) <- make.names(colnames(x_df_CNS), unique = TRUE)
+
+#Extract top ranked features
+imp_CNS_svm <- caret::varImp(svm_profile_CNS$fit, scale = FALSE)
+feature_ranks_CNS <- imp_CNS_svm$importance
+feature_ranks_CNS$Feature <- rownames(feature_ranks_CNS)
+
+if ("Overall" %in% colnames(feature_ranks_CNS)) {
+  score_CNS <- feature_ranks_CNS[["Overall"]]
+} else {
+  score_CNS <- rowMeans(as.matrix(feature_ranks_CNS[, setdiff(colnames(feature_ranks_CNS), "Feature"), drop = FALSE]), na.rm = TRUE)
+}
+
+ord_CNS <- order(-score_CNS)
+feature_ranks_CNS <- feature_ranks_CNS[ord_CNS, , drop = FALSE]
+
+k_CNS <- 25 
+top25_features_CNS <- rownames(feature_ranks_CNS)[seq_len(k_CNS)]
+top25_df <- feature_ranks_CNS[1:k_CNS, , drop = FALSE]
+
+write.csv(top25_df, file = file.path(svm_dir, "SVM_Top25_Features_List.csv"), row.names = TRUE)
+
+importance_selected_CNS <- top25_df
+if(!"Importance" %in% colnames(importance_selected_CNS)) {
+  importance_selected_CNS$Importance <- score_CNS[1:k_CNS]
+}
+
+# Plot Top 25
+p_CNS_plots <- ggplot(importance_selected_CNS, aes(x = Importance, y = reorder(Feature, Importance))) +
+  geom_point(aes(size = Importance), color = "#1271c9") +
+  scale_size_continuous(name = "SVM Importance", range = c(2, 8)) +
+  theme_light() + xlab("SVM Feature Importance") + ylab("Selected Features") +
+  ggtitle("Top 25 features selected_CNS_SVM-RFE") +
+  theme(
+    axis.text.y = element_text(color = "black", size = 10),
+    axis.text.x = element_text(color = "black", size = 10),
+    axis.title = element_text(size = 12),
+    legend.text = element_text(color = "black", size = 12),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )
+print(p_CNS_plots)
+ggsave(filename = file.path(svm_dir, "p_CNS_Top25.tiff"), plot = p_CNS_plots, width = 10, height = 8, dpi = 300)
+
+# Top 10 for plotting
+importance_top10_CNS <- importance_selected_CNS %>% slice_head(n = 10)
+
+p_top10_CNS_svm <- ggplot(importance_top10_CNS, aes(x = Importance, y = reorder(Feature, Importance))) +
+  geom_point(aes(size = Importance), color = "#1271c9") +
+  scale_size_continuous(name = "SVM Importance", range = c(2, 8), guide = guide_legend(override.aes = list(color = "#1271c9"))) +
+  theme_light() + xlab("SVM feature importance") + ylab("Proteins") +
+  ggtitle("Top Proteins_SVM_RFE_VD") +
+  theme(
+    axis.text.y = element_text(color = "black", size = 18),
+    axis.text.x = element_text(color = "black", size = 18),
+    axis.title = element_text(size = 18),
+    legend.text = element_text(color = "black", size = 18),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA),
+    plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )
+print(p_top10_CNS_svm)
+ggsave(filename = file.path(svm_dir, "p_top10_CNS.tiff"), plot = p_top10_CNS_svm, width = 10, height = 8, dpi = 300)
+
+# Heatmap SVM
+top10_features_CNS_svm <- as.character(importance_top10_CNS$Feature)
+group_vec_CNS_svm <- final_data_ML$CNS_Target
+order_idx_CNS_svm <- order(group_vec_CNS_svm)
+
+group_ordered_CNS_svm <- group_vec_CNS_svm[order_idx_CNS_svm]
+patient_ids_CNS_svm   <- final_data_ML$PatientID[order_idx_CNS_svm]
+
+top10_features_CNS_svm <- intersect(top10_features_CNS_svm, colnames(final_data_ML))
+mat_CNS_svm <- final_data_ML[order_idx_CNS_svm, top10_features_CNS_svm, drop = FALSE]
+mat_CNS_svm <- mat_CNS_svm[, sapply(mat_CNS_svm, is.numeric), drop = FALSE]
+mat_CNS_svm <- as.matrix(mat_CNS_svm)
+
+heatmap_data_CNS_svm <- t(scale(mat_CNS_svm))
+colnames(heatmap_data_CNS_svm) <- patient_ids_CNS_svm
+
+group_colors_svm <- c("CNS_1" = "#ff704d", "CNS_2_3" = "#668cff")
+annotation_col_CNS_svm <- HeatmapAnnotation(Groups = group_ordered_CNS_svm, col = list(Groups = group_colors_svm), annotation_name_side = "right")
+
+ht_CNS_svm <- Heatmap(
+  heatmap_data_CNS_svm,
+  name = "NPX",
+  top_annotation = annotation_col_CNS_svm,
+  cluster_columns = FALSE,
+  show_column_names = TRUE,
+  column_names_rot = 90,
+  column_names_gp = gpar(fontsize = 8),
+  row_names_gp = gpar(fontsize = 20),
+  column_title = "SVM Selected Top 10 Features (CNS Target)",
+  column_title_gp = gpar(fontsize = 18, fontface = "bold"),
+  heatmap_legend_param = list(title_gp = gpar(fontsize = 18, fontface = "plain"))
+)
+
+tiff(file.path(svm_dir, "SVM_Heatmap_Top.tiff"), width = 1200, height = 1000, res = 120)
+draw(ht_CNS_svm, heatmap_legend_side = "right", annotation_legend_side = "right")
+dev.off()
+
+#*********************
+#   Venn Diagram
+#*********************
+
+lasso_proteins_CNS <- unique(as.character(lasso_selected_proteins_CNS))
+lasso_proteins_CNS <- lasso_proteins_CNS[!is.na(lasso_proteins_CNS) & lasso_proteins_CNS != ""]
+
+rf_proteins_CNS <- unique(as.character(top10_selected_RF_CNS$Feature))
+rf_proteins_CNS <- rf_proteins_CNS[!is.na(rf_proteins_CNS) & rf_proteins_CNS != ""]
+
+svm_proteins_CNS <- unique(as.character(importance_top10_CNS$Feature))
+svm_proteins_CNS <- svm_proteins_CNS[!is.na(svm_proteins_CNS) & svm_proteins_CNS != ""]
+
+cats <- c("RF", "LASSO", "SVM")
+feature_lists <- list(RF = rf_proteins_CNS, LASSO = lasso_proteins_CNS, SVM = svm_proteins_CNS)
+cols <- c(RF = "#984ea3", LASSO = "#4daf4a", SVM = "#d95f02")
+
+category_labels <- paste0(cats, " (", sapply(feature_lists[cats], length), ")")
+
+venn.plot <- venn.diagram(
+  x = feature_lists[cats],
+  filename = NULL,
+  col = "transparent",
+  fill = cols[cats],
+  alpha = 0.50,
+  cex = 3.5,
+  fontfamily = "Arial",
+  cat.cex = 2.2,
+  cat.fontfamily = "Arial",
+  cat.col = cols[cats],
+  category.names = category_labels,
+  main = "Proteins selected by models (RF/LASSO/SVM) — CNS Target",
+  main.cex = 1,
+  main.fontface = "bold",
+  main.fontfamily = "Arial",
+  scaled = FALSE,
+  euler.d = FALSE,
+  rotation.degree = 0
+)
+
+tiff(filename = file.path(main_dir, "Venn_1_All_Models.tiff"), width = 12, height = 12, units = "in", res = 300)
+grid::grid.newpage()
+grid::grid.draw(venn.plot)
+dev.off()
+
+# Extract Shared lists
+selected_RF    <- rf_proteins_CNS
+selected_LASSO <- lasso_proteins_CNS
+selected_SVM   <- svm_proteins_CNS
+
+RF_only    <- setdiff(selected_RF, union(selected_LASSO, selected_SVM))
+LASSO_only <- setdiff(selected_LASSO, union(selected_RF, selected_SVM))
+SVM_only   <- setdiff(selected_SVM, union(selected_RF, selected_LASSO))
+
+RF_LASSO  <- setdiff(intersect(selected_RF, selected_LASSO), selected_SVM)
+RF_SVM    <- setdiff(intersect(selected_RF, selected_SVM), selected_LASSO)
+LASSO_SVM <- setdiff(intersect(selected_LASSO, selected_SVM), selected_RF)
+
+common_three <- Reduce(intersect, list(selected_RF, selected_LASSO, selected_SVM))
+
+# Exporting text report of Venn
+sink(file.path(main_dir, "Venn_Proteins_Summary.txt"))
+cat("RF only:", RF_only, "\n\nLASSO only:", LASSO_only, "\n\nSVM only:", SVM_only, "\n\n")
+cat("RF and LASSO shared:", RF_LASSO, "\n\nRF and SVM shared:", RF_SVM, "\n\nLASSO and SVM shared:", LASSO_SVM, "\n\n")
+cat("Common to all three:", common_three, "\n")
+sink()
+
+# Unique shared intersections vector
+nselect <- unique(c(RF_LASSO, RF_SVM, LASSO_SVM, common_three))
+
+# HEATMAP & ML VALIDATION FOR INTERSECTED/COMMON PROTEINS
+if(length(nselect) > 0) {
+  nselect_heatmap_data <- final_data_ML[, nselect, drop = FALSE]
+  order_idx_cns_final <- order(final_data_ML$CNS_Target)
+  nselect_heatmap_data <- nselect_heatmap_data[order_idx_cns_final, ]
+  group_ordered_cns_final <- final_data_ML$CNS_Target[order_idx_cns_final]
+  
+  nselect_heatmap_data <- t(as.matrix(nselect_heatmap_data))
+  colnames(nselect_heatmap_data) <- final_data_ML$PatientID[order_idx_cns_final]
+  
+  ht_nselect <- Heatmap(
+    nselect_heatmap_data,
+    name = "NPX",
+    top_annotation = HeatmapAnnotation(
+      Groups = group_ordered_cns_final,
+      col = list(Groups = group_colors_svm),
+      annotation_legend_param = list(Groups = list(title = "Groups", title_gp = gpar(fontsize = 16)))
+    ),
+    cluster_columns = FALSE,
+    show_column_names = TRUE,
+    column_names_rot = 90,
+    column_names_gp = gpar(fontsize = 6), 
+    row_names_gp = gpar(fontsize = 12),
+    column_title = "Common Proteins between selected important Features",
+    column_title_gp = gpar(fontsize = 16, fontface = "bold")
+  )
+  
+  tiff(filename = file.path(main_dir, "Heatmap_nselect_Top10.tiff"), width = 12, height = 10, units = "in", res = 300)
+  draw(ht_nselect, heatmap_legend_side = "right")
+  dev.off()
+  
+  # ML Validation on Intersected Proteins
+  current_features <- intersect(nselect, colnames(final_data_ML))
+  
+  df_nselect <- final_data_ML %>% select(all_of(current_features), CNS_Target)
+  df_nselect$CNS_Target <- factor(df_nselect$CNS_Target, levels = c("CNS_1", "CNS_2_3"))
+  
+  set.seed(123)
+  train_idx_ns <- createDataPartition(df_nselect$CNS_Target, p = 0.8, list = FALSE)
+  train_df_ns  <- df_nselect[train_idx_ns, ]
+  test_df_ns   <- df_nselect[-train_idx_ns, ]
+  
+  subtitle_nselect <- paste(current_features, collapse = ", ")
+  
+  model_nselect <- train(
+    CNS_Target ~ ., data = train_df_ns, method = "svmRadial",
+    trControl = trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = multiClassSummary)
+  )
+  
+  cm_train_ns <- confusionMatrix(predict(model_nselect, train_df_ns), train_df_ns$CNS_Target)
+  cm_test_ns  <- confusionMatrix(predict(model_nselect, test_df_ns), test_df_ns$CNS_Target)
+  
+  ggsave(file.path(main_dir, "CM_Top10_Train.tiff"), plot = plot_cm(cm_train_ns, "Training CM (Intersection Model)", round(cm_train_ns$overall["Accuracy"], 3), subtitle = subtitle_nselect, palette = "train"), width = 7, height = 6)
+  ggsave(file.path(main_dir, "CM_Top10_Test.tiff"), plot = plot_cm(cm_test_ns, "Test CM (Intersection Model)", round(cm_test_ns$overall["Accuracy"], 3), subtitle = subtitle_nselect, palette = "test"), width = 7, height = 6)
+} else {
+  cat("No overlapping features found between models to perform intersection heatmap/validation.\n")
+}
+
+cat("All integrated pipelines completed successfully for CNS_1 vs CNS_2_3 on VD samples!\n")
+
+
+#PREPARE DATA FOR MACHINE LEARNING 
+current_features <- intersect(nselect, colnames(final_data_ML))
+df_nselect <- final_data_ML %>% select(all_of(current_features), CNS_Target)
+
+# Standardize class names for internal R variable compliance
+df_nselect$CNS_Target <- factor(df_nselect$CNS_Target)
+levels(df_nselect$CNS_Target) <- make.names(levels(df_nselect$CNS_Target))
+
+x_ns <- as.matrix(df_nselect[, current_features, drop = FALSE])
+y_ns <- df_nselect$CNS_Target
+storage.mode(x_ns) <- "numeric"
+
+# LEAVE-ONE-OUT CROSS-VALIDATION (LOOCV) PIPELINE 
+set.seed(123)
+n_ns <- nrow(x_ns)
+ns_loocv_preds <- factor(levels = levels(y_ns))
+
+for (i in 1:n_ns) {
+  x_train_i <- x_ns[-i, , drop = FALSE]
+  y_train_i <- y_ns[-i]
+  x_test_i  <- x_ns[i, , drop = FALSE]
+  
+# Train SVM Radial on N-1 samples
+  svm_i <- svm(x_train_i, y_train_i, kernel = "radial", cost = 1, gamma = 1/ncol(x_ns))
+  ns_loocv_preds[i] <- predict(svm_i, newdata = x_test_i)
+}
+
+# Restore official factor levels
+levels(ns_loocv_preds) <- c("CNS_1", "CNS_2_3")
+levels(y_ns)           <- c("CNS_1", "CNS_2_3")
+
+# Calculate Performance Metrics
+ns_loocv_conf <- table(Predicted = ns_loocv_preds, Actual = y_ns)
+ns_loocv_acc  <- mean(ns_loocv_preds == y_ns)
+
+# Save raw confusion matrix to CSV
+write.csv(as.data.frame.matrix(ns_loocv_conf), file = file.path(main_dir, "Intersection_Model_LOOCV_Matrix.csv"))
+
+# PLOT AND SAVE THE LOOCV CONFUSION MATRIX 
+subtitle_nselect <- paste(current_features, collapse = ", ")
+
+p_cm_ns_loocv <- plot_cm(
+  cm = list(table = as.table(ns_loocv_conf)), 
+  title = "Intersection Model LOOCV Confusion Matrix", 
+  acc = round(ns_loocv_acc, 3), 
+  subtitle = paste("LOOCV using shared proteins:", subtitle_nselect), 
+  palette = "test"
+)
+
+print(p_cm_ns_loocv)
+ggsave(file.path(main_dir, "CM_Intersection_LOOCV.tiff"), plot = p_cm_ns_loocv, width = 8, height = 7, dpi = 300, compression = "lzw")
+
+
+
+cat("All integrated pipelines completed successfully with unified LOOCV validation!\n")
+
+
+# BOOTSTRAP SCREENING FOR VD SAMPLE
+
+# FUNCTION DEFINITION (Stratified for CNS_Target)
+run_svm_bootstrap <- function(list_of_prots, data, n_boot = 1000) {
+  final_res <- data.frame()
+  
+# Ensure target is a strict factor with standard compliance
+  data$CNS_Target <- factor(data$CNS_Target)
+  levs <- levels(data$CNS_Target)
+  pos_class <- make.names(levs[2])
+  levels(data$CNS_Target) <- make.names(levs)
+  
+  for (group_name in names(list_of_prots)) {
+    p <- list_of_prots[[group_name]]
+    if(length(p) == 0) next
+    
+    boot_aucs <- numeric(n_boot)
+    cat("Processing Group (VD):", group_name, "\n")
+    
+# Separate indices by class for stratified sampling
+    idx_class1 <- which(data$CNS_Target == levels(data$CNS_Target)[1])
+    idx_class2 <- which(data$CNS_Target == levels(data$CNS_Target)[2])
+    
+    set.seed(12345)
+    for (i in 1:n_boot) {
+# STRATIFIED SAMPLING - Sample within each class separately
+      train_idx1 <- sample(idx_class1, replace = TRUE)
+      train_idx2 <- sample(idx_class2, replace = TRUE)
+      train_idx  <- c(train_idx1, train_idx2)
+      
+      train_set <- data[train_idx, ]
+      oob_idx   <- setdiff(1:nrow(data), unique(train_idx))
+      test_set  <- data[oob_idx, ]
+      
+# Safety check to guarantee both classes exist in OOB
+      if(length(unique(test_set$CNS_Target)) < 2) {
+        missing_from_oob <- setdiff(1:nrow(data), oob_idx)
+        extra_1 <- sample(intersect(missing_from_oob, idx_class1), 1)
+        extra_2 <- sample(intersect(missing_from_oob, idx_class2), 1)
+        test_set <- rbind(test_set, data[c(extra_1, extra_2), ])
+      }
+      
+# SVM Radial Model
+      svm_fit <- e1071::svm(CNS_Target ~ ., 
+                            data = train_set[, c(p, "CNS_Target")], 
+                            kernel = "radial", 
+                            probability = TRUE)
+      
+# OOB Prediction
+      pred <- predict(svm_fit, test_set[, p], probability = TRUE)
+      probs <- attr(pred, "probabilities")
+      prob_scores <- probs[, pos_class]
+      
+# Calculate OOB AUC safely
+      roc_obj <- tryCatch(pROC::roc(test_set$CNS_Target, prob_scores, quiet = TRUE), error = function(e) NULL)
+      if(!is.null(roc_obj)) {
+        boot_aucs[i] <- as.numeric(roc_obj$auc)
+      } else {
+        boot_aucs[i] <- NA
+      }
+    }
+    
+    valid_aucs <- boot_aucs[!is.na(boot_aucs)]
+    if(length(valid_aucs) == 0) valid_aucs <- c(0.5)
+    
+    final_res <- rbind(final_res, data.frame(
+      Group = group_name,
+      N = length(p),
+      Mean_OOB_AUC = round(mean(valid_aucs), 3),
+      SD_AUC = round(sd(valid_aucs), 3),
+      CI_Lower = round(quantile(valid_aucs, 0.025), 3),
+      CI_Upper = round(quantile(valid_aucs, 0.975), 3),
+      Proteins = paste(sort(p), collapse = ", ")
+    ))
+  }
+  return(final_res)
+}
+
+
+# Initial Setup - Dynamic Core and Candidates for VD
+selected_RF    <- unique(as.character(top10_selected_RF_CNS$Feature))
+selected_SVM   <- unique(as.character(importance_top10_CNS$Feature))
+
+# Core is the intersection of RF and SVM (LASSO is 0 for VD)
+core <- intersect(selected_RF, selected_SVM) 
+all_selected_prots <- unique(c(selected_RF, selected_SVM))
+candidates_to_test <- setdiff(all_selected_prots, core)
+
+cat("Core proteins (Shared RF & SVM, n =", length(core), "):", paste(core, collapse=", "), "\n")
+cat("Candidates for 5+1 screening (n =", length(candidates_to_test), "):", paste(candidates_to_test, collapse=", "), "\n")
+
+# Step 1: Calculating Baseline for Core (OOB)
+cat("\n--- Step 1: Calculating Baseline for Core ---\n")
+core_boot_res <- run_svm_bootstrap(list(Core_Only = core), final_data_ML_scaled, n_boot = 1000)
+base_auc <- core_boot_res$Mean_OOB_AUC
+cat("Baseline AUC (Core Only):", base_auc, "\n")
+
+# Step 2: Phase 1 - Screening (Core + 1)
+cat("\n--- Step 2: Phase 1 - Screening (Each Candidate + Core) ---\n")
+screening_list <- list()
+for(prot in candidates_to_test) {
+  screening_list[[prot]] <- unique(c(core, prot))
+}
+
+phase1_results <- run_svm_bootstrap(screening_list, final_data_ML_scaled, n_boot = 1000)
+phase1_output <- rbind(core_boot_res, phase1_results) %>% arrange(desc(Mean_OOB_AUC))
+
+write_xlsx(phase1_output, file.path(main_dir, "Phase1_Screening_Results_VD.xlsx"))
+print(head(phase1_output, 10))
+
+# Step 3: Filter Winners & Build Final Combinations
+
+winners <- phase1_output %>% 
+  filter(Mean_OOB_AUC > base_auc & Group != "Core_Only") %>% 
+  pull(Group)
+
+cat("\nWinners that improved the Core:", paste(winners, collapse=", "), "\n")
+
+final_combos <- list(Core_Only = core)
+if(length(winners) > 0) {
+  for(i in 1:length(winners)) {
+    cmb <- combn(winners, i, simplify = FALSE)
+    for(j in seq_along(cmb)) {
+      name <- paste0("Core_plus_", i, "_selected_", j)
+      final_combos[[name]] <- unique(c(core, cmb[[j]]))
+    }
+  }
+}
+
+# Step 4: Phase 2 - Final Evaluation
+cat("\n--- Step 4: Phase 2 - Evaluating Winning Combinations ---\n")
+set.seed(123)
+phase2_results <- run_svm_bootstrap(final_combos, final_data_ML_scaled, n_boot = 1000)
+
+phase2_results <- phase2_results %>% arrange(desc(Mean_OOB_AUC))
+write_xlsx(phase2_results, file.path(main_dir, "Phase2_Final_Combinations_Results_VD.xlsx"))
+
+print(head(phase2_results, 10))
+
+
+# Joining to table together
+
+final_report_ordered <- bind_rows(
+  phase1_output %>% mutate(Phase = "Phase 1"),
+  phase2_results %>% mutate(Phase = "Phase 2") 
+) %>% 
+  distinct(Proteins, .keep_all = TRUE) 
+
+
+final_report_clean <- final_report_ordered %>%
+  rowwise() %>%
+  mutate(
+    Proteins = {
+      prots <- unlist(strsplit(Proteins, ", "))
+      prots_final <- ifelse(prots %in% core, paste0("[", prots, "]"), prots)
+      paste(sort(prots_final), collapse = ", ")
+    }
+  ) %>%
+  #Coloumn selection
+  select(Phase, Group, N, Mean_OOB_AUC, Proteins) %>%
+  arrange(Phase, desc(Mean_OOB_AUC))
+
+library(writexl)
+write_xlsx(final_report_clean, file.path(main_dir, "Ordered_Phases_Report.xlsx"))
+
+
+#Draw the Graphs
+boot_selected <- c("CCL4", "CTSC", "CXCL10", "CXCL9", "MMP7")
+
+group_vec_cns <- ifelse(final_data_ML$Group_CNS_Involvement %in% c("2", "3"), "CNS2+3", "CNS1")
+
+order_idx_cns_final <- order(group_vec_cns)
+group_ordered_cns_final <- group_vec_cns[order_idx_cns_final]
+
+my_colors <- c("CNS1" = "#ff704d", "CNS2+3" = "#668cff")
+
+nselect_heatmap_data <- final_data_ML[order_idx_cns_final, boot_selected, drop = FALSE]
+nselect_heatmap_data <- t(as.matrix(nselect_heatmap_data))
+colnames(nselect_heatmap_data) <- final_data_ML$PatientID[order_idx_cns_final]
+
+ht_nselect <- Heatmap(
+  nselect_heatmap_data,
+  name = "NPX",
+  top_annotation = HeatmapAnnotation(
+    Groups = group_ordered_cns_final,
+    col = list(Groups = my_colors),
+    annotation_legend_param = list(Groups = list(title = "Groups", title_gp = gpar(fontsize = 16)))
+  ),
+  cluster_columns = FALSE,
+  show_column_names = TRUE,
+  column_names_rot = 90,
+  column_names_gp = gpar(fontsize = 6), 
+  row_names_gp = gpar(fontsize = 12),
+  column_title = "CNS1_Vs_2+3_VD",
+  column_title_gp = gpar(fontsize = 16, fontface = "bold")
+)
+
+file_path_heatmap <- "Boot_ProteinsCNS.png"
+png(file_path_heatmap, width = 1200, height = 900, res = 150)
+draw(ht_nselect)
+dev.off()
+
+
+
+#==========================================================ML for CNS1 and CNS2+3 in VR =============================================================
+
+set.seed(12345)
+final_data_3 <- read_excel("Final_data_3.xlsx")
+
+# Update DT values
+final_data_3$DiseaseType[final_data_3$DiseaseType == "T-ALL"] <- 1
+final_data_3$DiseaseType[final_data_3$DiseaseType == "B-ALL"] <- 2
+final_data_3$DiseaseType <- as.numeric(as.character(final_data_3$DiseaseType))
+
+# Update Gender values
+final_data_3$Gender[final_data_3$Gender == "F"] <- 1
+final_data_3$Gender[final_data_3$Gender == "M"] <- 2
+final_data_3$Gender <- as.numeric(as.character(final_data_3$Gender))
+
+
+# Clean extra spaces and convert everything to real NA
+final_data_3$Group_CNS_Involvement <- trimws(as.character(final_data_3$Group_CNS_Involvement))
+final_data_3$Group_CNS_Involvement[final_data_3$Group_CNS_Involvement == "NA"] <- NA
+
+# Delete rows where CNS group is missing
+final_data_ML <- final_data_3[!is.na(final_data_3$Group_CNS_Involvement) & final_data_3$Group_CNS_Involvement != "", ]
+
+#  STRICTLY KEEP ONLY RECOVERY/RELAPSE SAMPLES (VR) TO AVOID DATA LEAKAGE
+final_data_ML <- final_data_ML %>% filter(Visitcode == "VR")
+
+#  Create the new binary target variable for CNS classification
+final_data_ML <- final_data_ML %>%
+  mutate(CNS_Target = case_when(
+    Group_CNS_Involvement == "1" ~ "CNS_1",
+    Group_CNS_Involvement %in% c("2", "3") ~ "CNS_2_3",
+    TRUE ~ NA_character_
+  ))
+
+final_data_ML$CNS_Target <- as.factor(final_data_ML$CNS_Target)
+
+# Fix non-numeric columns if any leftover
+cols_to_fix <- c("DiseaseType", "Gender", "Group_CNS_Involvement")
+for(col in cols_to_fix) {
+  final_data_ML[[col]] <- as.numeric(as.character(final_data_ML[[col]]))
+}
+
+#*********************
+# DIRECTORIES SETUP
+#*********************
+
+main_dir <- "MachineLearning_CNS_VR_Only"
+dir.create(main_dir, showWarnings = FALSE)
+
+rf_dir    <- file.path(main_dir, "RF")
+lasso_dir <- file.path(main_dir, "LASSO")
+svm_dir   <- file.path(main_dir, "SVM")
+
+dir.create(rf_dir, showWarnings = FALSE)
+dir.create(lasso_dir, showWarnings = FALSE)
+dir.create(svm_dir, showWarnings = FALSE)
+
+# Define metadata columns
+metadata_cols <- c("WellID", "PatientID", "Visit", "Visitcode", "CNS_Involvement", "Group_CNS_Involvement", "CNS_Target")
+assay_cols <- names(final_data_ML)[!names(final_data_ML) %in% metadata_cols]
+
+#Confusion Matrix Plot Custom Function
+while (!is.null(dev.list())) dev.off()
+
+plot_cm <- function(cm, title, acc, subtitle = "", palette = "train") {
+  m <- as.data.frame(cm$table)
+  colnames(m) <- c("Predicted","True","Freq")
+  ggplot(m, aes(Predicted, True, fill = Freq)) +
+    geom_tile(color = "white", linewidth = 1.2) +
+    geom_text(aes(label = Freq), color = "black", size = 10, fontface = "bold") +
+    scale_fill_gradient(low = "#e8f5e9", high = "#2e7d32", guide = guide_colourbar(barheight = unit(30, "lines"), barwidth = unit(1, "lines"), ticks.colour = "black", frame.colour = "black")) +
+    labs(title = paste0(title, " (Accuracy = ", acc, ")"), subtitle = subtitle, x = "Predicted label", y = "True label", fill = NULL) +
+    theme_minimal(base_size = 24) + theme(plot.title = element_text(size = 24, face = "bold"), plot.subtitle = element_text(size = 12, face = "italic", color = "gray20"), axis.text = element_text(size = 22), legend.title = element_blank(), legend.text = element_text(size = 20))
+}
+
+
+#*********************
+#  Random Forest  
+#*********************
+
+rf_data_CNS <- na.omit(final_data_ML)
+cols_to_keep_CNS <- c("CNS_Target", assay_cols)
+rf_data_CNS <- rf_data_CNS[, cols_to_keep_CNS]
+
+set.seed(123)
+rf_model_CNS <- randomForest(CNS_Target ~ ., data = rf_data_CNS, importance = TRUE)
+
+imp_CNS <- importance(rf_model_CNS)
+imp_CNS_df <- data.frame(Protein = rownames(imp_CNS), MeanDecreaseGini = imp_CNS[, "MeanDecreaseGini"])
+imp_CNS_df <- imp_CNS_df[order(-imp_CNS_df$MeanDecreaseGini), ]
+
+imp_CNS_df_top30 <- imp_CNS_df[1:30, ] %>%
+  rownames_to_column("Feature") %>%
+  arrange(desc(MeanDecreaseGini))
+
+size_breaks <- c(-Inf, 0.60, 0.90, 1.20, 1.50, Inf)
+size_labels <- c("≤0.60", "0.60–0.90", "0.90–1.20", "1.20–1.50", "≥1.50")
+size_map    <- c("≤0.60" = 2, "0.60–0.90" = 4, "0.90–1.20" = 6, "1.20–1.50" = 8, "≥1.50" = 10)
+
+imp_CNS_df_top30$SizeBin <- cut(imp_CNS_df_top30$MeanDecreaseGini, breaks = size_breaks, labels = size_labels, right = TRUE, include.lowest = TRUE)
+
+p <- ggplot(imp_CNS_df_top30, aes(x = MeanDecreaseGini, y = reorder(Feature, MeanDecreaseGini))) +
+  geom_point(aes(size = SizeBin), color = "#1271c9") +
+  scale_size_manual(name = "Avg. MDGini", values = size_map, guide = guide_legend(override.aes = list(color = "#1271c9"))) +
+  theme_light() + xlab("Average MDGini") + ylab("Features") +
+  ggtitle("Top 30 important features Based on CNS_Target_RF (VR Samples)") +
+  theme(
+    axis.text.y = element_text(color = "black", size = 10),
+    axis.text.x = element_text(color = "black", size = 10),
+    axis.title = element_text(size = 12),
+    legend.text = element_text(color = "black", size = 12),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )+xlab("Average MDGini") +
+  ylab("Proteins") +
+  ggtitle("Top 30 important features_RF")
+print(p)
+ggsave(filename = file.path(rf_dir, "RF_Top30_Importance.tiff"), plot = p, width = 10, height = 8, dpi = 300)
+write.csv(imp_CNS_df, file = file.path(rf_dir, "RF_Full_Importance.csv"), row.names = FALSE)
+write.csv(imp_CNS_df_top30, file = file.path(rf_dir, "RF_Top30_Importance.csv"), row.names = FALSE)
+
+# RF-ROC 
+rf_data_roc <- final_data_ML
+set.seed(123)
+train_idx <- createDataPartition(rf_data_roc$CNS_Target, p = 0.8, list = FALSE)
+train_data_CNS <- rf_data_roc[train_idx, ]
+test_data_CNS  <- rf_data_roc[-train_idx, ]
+
+train_subset <- na.roughfix(train_data_CNS[, c("CNS_Target", assay_cols)])
+test_subset  <- na.roughfix(test_data_CNS[, c("CNS_Target", assay_cols)])
+
+set.seed(123)
+rf_model_ROC <- randomForest(CNS_Target ~ ., data = train_subset, importance = TRUE)
+pred_probs_CNS <- predict(rf_model_ROC, newdata = test_subset, type = "prob")
+
+target_class <- "CNS_2_3"
+roc_obj <- roc(test_subset$CNS_Target == target_class, pred_probs_CNS[, target_class])
+auc_val <- auc(roc_obj)
+
+roc_df <- data.frame(fpr = 1 - roc_obj$specificities, tpr = roc_obj$sensitivities)
+p_roc <- ggplot(roc_df, aes(x = fpr, y = tpr)) +
+  geom_line(color = "#1271c9", linewidth = 1.2) + geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray") +
+  annotate("text", x = 0.6, y = 0.2, label = paste0("AUC = ", round(auc_val, 3)), size = 6, fontface = "bold") +
+  labs(title = paste("ROC Curve (80/20 Split) -", target_class, "(VR Samples)"), x = "False Positive Rate (1 - Specificity)", y = "True Positive Rate (Sensitivity)") +
+  theme_light()+theme(
+    axis.text.y = element_text(color = "black", size = 10),
+    axis.text.x = element_text(color = "black", size = 10),
+    axis.title = element_text(size = 12),
+    legend.text = element_text(color = "black", size = 12),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )
+
+print(p_roc)
+ggsave(filename = file.path(rf_dir, "RF_ROC_Curve.png"), plot = p_roc, width = 8, height = 6, dpi = 300)
+
+#RF 5-Fold Cross Validation 
+set.seed(1234)
+top_features <- imp_CNS_df_top30$Feature
+target_col_cns <- "CNS_Target"
+df_cv_cns <- rf_data_CNS[, c(target_col_cns, top_features)]
+
+k <- 5
+n <- nrow(df_cv_cns)
+folds <- integer(n)
+cls <- df_cv_cns[[target_col_cns]]
+
+for (lev in levels(cls)) {
+  idx <- which(cls == lev)
+  idx <- sample(idx, length(idx), replace = FALSE)
+  grp_ids <- rep(1:k, length.out = length(idx))
+  folds[idx] <- grp_ids
+}
+
+feat_names <- setdiff(colnames(df_cv_cns), target_col_cns)
+cv_models_cns <- vector("list", k)
+cv_acc_cns <- numeric(k)
+cv_conf_cns <- vector("list", k)
+names(cv_models_cns) <- names(cv_acc_cns) <- names(cv_conf_cns) <- paste0("Fold", 1:k)
+cv_import_cns <- matrix(NA_real_, nrow = length(feat_names), ncol = k, dimnames = list(feat_names, paste0("Fold", 1:k)))
+
+for (i in 1:k) {
+  train_i <- df_cv_cns[folds != i, ] 
+  test_i  <- df_cv_cns[folds == i, ]
+  rf_i <- randomForest(as.formula(paste(target_col_cns, "~ .")), data = train_i, importance = TRUE)
+  pred_i <- predict(rf_i, newdata = test_i)
+  acc_i <- mean(pred_i == test_i[[target_col_cns]])
+  
+  run_name <- paste0("Fold", i)
+  cv_models_cns[[run_name]] <- rf_i
+  cv_acc_cns[run_name] <- acc_i
+  cv_conf_cns[run_name] <- list(table(Truth = test_i[[target_col_cns]], Pred = pred_i))
+  
+  if (!is.null(rf_i$importance)) {
+    common_feats <- intersect(feat_names, rownames(rf_i$importance))
+    cv_import_cns[common_feats, run_name] <- rf_i$importance[common_feats, "MeanDecreaseGini"]
+  }
+}
+
+cv_res_df <- data.frame(Fold = names(cv_acc_cns), Accuracy = as.numeric(cv_acc_cns))
+cv_res_df <- rbind(cv_res_df, data.frame(Fold = "Average", Accuracy = mean(cv_acc_cns)))
+write.csv(cv_res_df, file = file.path(rf_dir, "RF_CV_Accuracy.csv"), row.names = FALSE)
+
+sink(file.path(rf_dir, "RF_CV_Confusion_Matrices.txt"))
+print(cv_conf_cns)
+sink()
+
+write.csv(cv_import_cns, file = file.path(rf_dir, "RF_CV_Importance_Per_Fold.csv"))
+saveRDS(rf_model_CNS, file = file.path(rf_dir, "final_rf_model.rds"))
+
+agg_conf_cns <- Reduce(`+`, cv_conf_cns)
+mean_imp_cv_cns <- sort(rowMeans(cv_import_cns, na.rm = TRUE), decreasing = TRUE)
+
+write.csv(as.data.frame.matrix(agg_conf_cns), file = file.path(rf_dir, "RF_CV_Aggregated_Confusion_Matrix.csv"))
+
+cm_cv_aggregated <- list(table = as.table(agg_conf_cns))
+cv_total_acc <- round(sum(diag(agg_conf_cns)) / sum(agg_conf_cns), 3)
+
+p_cm_cv <- plot_cm(cm = cm_cv_aggregated, title = "RF Aggregated CV Confusion Matrix", acc = cv_total_acc, subtitle = "Total results across all 5 folds (VR)")
+print(p_cm_cv)
+
+tiff(file.path(rf_dir, "CM_Validation.tiff"), width = 10, height = 8, units = "in", res = 300, compression = "lzw")
+print(p_cm_cv)
+dev.off()
+
+#Top 10 Visualizations
+top_n_CNS <- 10
+top10_selected_RF_CNS <- imp_CNS_df %>% slice(1:top_n_CNS) %>% rownames_to_column("Feature") %>% arrange(desc(MeanDecreaseGini))
+top10_selected_RF_CNS <- top10_selected_RF_CNS %>% mutate(SizeBin = cut(MeanDecreaseGini, breaks = size_breaks, labels = size_labels, right = TRUE, include.lowest = TRUE))
+
+p_top10_CNS <- ggplot(top10_selected_RF_CNS, aes(x = MeanDecreaseGini, y = reorder(Feature, MeanDecreaseGini))) +
+  geom_point(aes(size = SizeBin), color = "#1271c9") +
+  scale_size_manual(name = "Avg. MDGini", values = size_map, drop = FALSE, guide = guide_legend(override.aes = list(color = "#1271c9"))) +
+  theme_light() +
+  theme(
+    axis.text.y = element_text(color = "black", size = 18),
+    axis.text.x = element_text(color = "black", size = 18),
+    axis.title = element_text(size = 18),
+    legend.text = element_text(color = "black", size = 18),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA),
+    plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )+xlab("Average MDGini") +
+  ylab("Proteins") +
+  ggtitle("Top important proteins_RF_VR")
+print(p_top10_CNS)
+ggsave(filename = file.path(rf_dir, "RF_top10_CNS.tiff"), plot = p_top10_CNS, width = 15, height = 10, dpi = 300)
+
+# Boxplots RF
+top10_features_CNS <- top10_selected_RF_CNS$Feature
+plot_data_imp_groups_RF_CNS <- final_data_ML %>%
+  select(all_of(c(top10_features_CNS, "CNS_Target"))) %>% 
+  pivot_longer(cols = all_of(top10_features_CNS), names_to = "Protein", values_to = "Expression")
+
+p_imp_groups_RF_CNS <- ggplot(plot_data_imp_groups_RF_CNS, aes(x = CNS_Target, y = Expression, fill = CNS_Target)) +
+  geom_boxplot(width = 0.8, alpha = 0.8, color = "black", outlier.size = 0.5) +
+  geom_jitter(width = 0.1, size = 0.5, alpha = 0.8) +
+  facet_wrap(~Protein, ncol = 5, scales = "free_y") +
+  scale_fill_manual(values = c("CNS_1" = "#ff704d", "CNS_2_3" = "#668cff")) +
+  theme_bw() + labs(title = "Top 10 Features Differentiating CNS Groups_RF (VR Samples)", y = "Protein abundance (NPX)", x = "Groups", fill = "Groups") +
+  theme(
+    axis.text = element_text(color = "black", size = 18), 
+    axis.title = element_text(color = "black", size = 18),
+    
+# PROTEIN NAME SETTING
+    strip.background = element_rect(fill = "white", color = "black", size = 1),
+    strip.text = element_text(size = 18, face = "plain", color = "black"),
+    plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+# Total font and gard
+    text = element_text(family = "Arial"),
+    panel.border = element_rect(color = "black", fill = NA, size = 1), 
+    
+# Eleminate grids line
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    
+    legend.position = "none"
+  )
+print(p_imp_groups_RF_CNS)
+ggsave(filename = file.path(rf_dir, "RF_Top10_Boxplots.png"), plot =  p_imp_groups_RF_CNS, width = 15, height = 10, dpi = 300)
+
+# Heatmap RF
+top10_heatmap_data_CNS <- final_data_ML[, top10_features_CNS, drop = FALSE]
+group_vec_CNS <- final_data_ML$CNS_Target
+order_idx_CNS <- order(group_vec_CNS)
+
+top10_heatmap_data_CNS <- t(as.matrix(top10_heatmap_data_CNS[order_idx_CNS, ]))
+colnames(top10_heatmap_data_CNS) <- final_data_ML$PatientID[order_idx_CNS]
+group_ordered_CNS <- group_vec_CNS[order_idx_CNS]
+
+group_colors <- c("CNS_1" = "#ff704d", "CNS_2_3" = "#668cff")
+annotation_col_CNS <- HeatmapAnnotation(Groups = group_ordered_CNS, col = list(Groups = group_colors), annotation_name_side = "right", annotation_legend_param = list(Groups = list(title = "Groups", title_gp = gpar(fontsize = 18, fontface = "plain"))))
+
+ht_CNS <- Heatmap(top10_heatmap_data_CNS, name = "NPX", top_annotation = annotation_col_CNS, cluster_columns = FALSE, show_column_names = TRUE, column_names_rot = 90, column_names_gp = gpar(fontsize = 8), row_names_gp = gpar(fontsize = 20), column_title = "Important features selected by RF (Top 10)_CNS (VR)", column_title_gp = gpar(fontsize = 18, fontface = "bold"), heatmap_legend_param = list(title_gp = gpar(fontsize = 18, fontface = "plain")))
+
+draw(ht_CNS, heatmap_legend_side = "right", annotation_legend_side = "right")
+tiff(file.path(rf_dir, "RF_Heatmap_Top10.tiff"), width = 1200, height = 1000, res = 120)
+draw(ht_CNS, heatmap_legend_side = "right", annotation_legend_side = "right")
+dev.off()
+
+
+#*******************
+#   Random Forest  
+#*******************
+
+final_data_ML <- final_data_ML %>% na.omit(subset = assay_cols)
+
+# Scaling
+scaled_assays <- final_data_ML %>% select(-all_of(metadata_cols)) %>% as.data.frame() %>% scale() %>% as.data.frame()
+scaled_assays$CNS_Target <- final_data_ML$CNS_Target
+final_data_ML_scaled <- scaled_assays
+
+y_lasso <- as.factor(final_data_ML_scaled$CNS_Target)
+x_lasso <- as.matrix(final_data_ML_scaled[, colnames(final_data_ML_scaled) != "CNS_Target"])
+
+set.seed(123)
+cvfit_CNS <- cv.glmnet(x_lasso, y_lasso, family = "binomial", type.measure = "class", nfolds = 10)
+
+tiff(filename = file.path(lasso_dir, "cvfit_CNS.tiff"), width = 10, height = 8, units = "in", res = 300)
+plot(cvfit_CNS)
+dev.off()
+
+lambda_1se <- cvfit_CNS$lambda.1se
+coefs_CNS <- coef(cvfit_CNS, s = lambda_1se)
+
+lasso_selected_proteins_CNS <- rownames(coefs_CNS)[which(coefs_CNS != 0)]
+lasso_selected_proteins_CNS <- setdiff(lasso_selected_proteins_CNS, "(Intercept)")
+
+write.csv(lasso_selected_proteins_CNS, file = file.path(lasso_dir, "LASSO_Selected_Proteins.csv"), row.names = FALSE)
+
+# Safe check - Only generate plots and confusion matrix if LASSO selected at least one protein
+if (length(lasso_selected_proteins_CNS) > 0) {
+  
+  coef_df_CNS <- data.frame(Proteins = rownames(coefs_CNS), Coefficient = as.numeric(coefs_CNS[,1]), stringsAsFactors = FALSE) %>% 
+    filter(Proteins != "(Intercept)", Coefficient != 0)
+  
+# Coefficients Plot
+  coef_df_selected_CNS <- coef_df_CNS %>%
+    mutate(Feature = Proteins, Value = Coefficient, StrengthBin = cut(abs(Coefficient), breaks = c(-Inf, 0.05, 0.10, 0.15, Inf), labels = c("< 0.05", "0.05–0.10", "0.10–0.15", "> 0.15"), right = TRUE))
+  
+  p_lasso_coef_CNS <- ggplot(coef_df_selected_CNS, aes(x = Value, y = reorder(Feature, Value))) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_point(color = "#1271c9", aes(size = StrengthBin), alpha = 0.95) +
+    theme_light() +theme(
+      axis.text.y = element_text(color = "black", size = 18),
+      axis.text.x = element_text(color = "black", size = 18),
+      axis.title = element_text(size = 18),
+      legend.text = element_text(color = "black", size = 18, hjust = 0.5),
+      legend.box.just = "center",      
+      legend.title = element_text(hjust = 0.5, size = 16, face = "bold"), 
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(color = "black", fill = NA),
+      plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+      legend.position = "right",
+    )+
+    xlab("Coefficient") + ylab("Proteins") + ggtitle("LASSO selected proteins coefficients_VR")
+  
+  print(p_lasso_coef_CNS)
+  ggsave(filename = file.path(lasso_dir, "p_lasso_coef_CNS_pointdesign.tiff"), plot = p_lasso_coef_CNS, width = 10, height = 8, dpi = 300)
+  
+# Boxplots LASSO
+  plot_data_lasso_groups_CNS <- final_data_ML %>%
+    select(all_of(c(lasso_selected_proteins_CNS, "CNS_Target"))) %>%
+    pivot_longer(cols = all_of(lasso_selected_proteins_CNS), names_to = "Protein", values_to = "Expression")
+  
+  p_lasso_groups_CNS <- ggplot(plot_data_lasso_groups_CNS, aes(x = CNS_Target, y = Expression, fill = CNS_Target)) +
+    geom_boxplot(width = 0.8, alpha = 0.8, color = "black", outlier.size = 0.5) + geom_jitter(width = 0.2, size = 0.5, alpha = 0.8) +
+    facet_wrap(~Protein, ncol = 5, scales = "free_y") + scale_fill_manual(values = c("CNS_1" = "#ff704d", "CNS_2_3" = "#668cff")) +
+    theme_bw() + labs(title = "Lasso-Selected Proteins Expression by CNS Groups (VR)", y = "Protein Expression (NPX)", x = "Groups", fill = "Groups") +
+    theme(
+      axis.text = element_text(color = "black", size = 18), 
+      axis.title = element_text(color = "black", size = 18),
+      
+# PROTEIN NAME SETTING
+      strip.background = element_rect(fill = "white", color = "black", size = 1),
+      strip.text = element_text(size = 18, face = "plain", color = "black"),
+      plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+# Total font and gard
+      text = element_text(family = "Arial"),
+      panel.border = element_rect(color = "black", fill = NA, size = 1), 
+      
+# Eleminate grids line
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      
+      legend.position = "none"
+    )  
+  print(p_lasso_groups_CNS)
+  ggsave(filename = file.path(lasso_dir, "p_lasso_groups_CNS.tiff"), plot = p_lasso_groups_CNS, width = 10, height = 8, dpi = 300)
+  
+# Lasso Confusion Matrix
+  lasso_preds <- predict(cvfit_CNS, newx = x_lasso, s = "lambda.1se", type = "class")
+  lasso_conf_matrix <- table(Predicted = as.factor(lasso_preds), Actual = y_lasso)
+  lasso_acc_round <- round(sum(diag(lasso_conf_matrix)) / sum(lasso_conf_matrix), 3)
+  
+  p_cm_lasso <- plot_cm(cm = list(table = as.table(lasso_conf_matrix)), title = "LASSO Confusion Matrix", acc = lasso_acc_round, subtitle = paste("Based on", length(lasso_selected_proteins_CNS), "selected proteins (VR)"))
+  print(p_cm_lasso)
+  ggsave(filename = file.path(lasso_dir, "LASSO_CM_Validation.tiff"), plot = p_cm_lasso, width = 8, height = 8, dpi = 300)
+  
+} else {
+# If no features selected, log a message and skip plotting to avoid errors
+  cat("Notice: LASSO under 1se criteria shrunk all coefficients to zero for VR samples. Skipping plots.\n")
+}
+
+
+#*******************
+#     SVM  
+#*******************
+
+# Prepare Data for SVM using CNS_Target
+metadata_cols_svm <- c("WellID", "PatientID", "Visit", "Visitcode", "CNS_Involvement", "Group_CNS_Involvement", "CNS_Target")
+actual_features <- setdiff(colnames(final_data_ML_scaled), metadata_cols_svm)
+
+y_svm <- as.factor(final_data_ML$CNS_Target)
+x_svm <- as.matrix(final_data_ML_scaled[rownames(final_data_ML), actual_features])
+storage.mode(x_svm) <- "numeric"
+
+#  BASIC SVM (RADIAL)
+set.seed(123)
+tuned_svm <- tune.svm(
+  x_svm, y_svm,
+  kernel = "radial",
+  cost = c(0.1, 1, 10, 100),  
+  gamma = c(0.001, 0.01, 0.1, 1) 
+)
+
+best_svm_model <- tuned_svm$best.model
+saveRDS(best_svm_model, file = file.path(svm_dir, "best_svm_model.rds"))
+
+pred_CNS_svm <- predict(best_svm_model, x_svm)
+svm_acc <- mean(pred_CNS_svm == y_svm)
+
+# Plot Basic SVM Confusion Matrix
+p_cm_svm_radial <- plot_cm(
+  cm = list(table = as.table(table(Predicted = pred_CNS_svm, Actual = y_svm))), 
+  title = "SVM Radial Confusion Matrix", 
+  acc = round(svm_acc, 3), 
+  subtitle = "Based on all available proteins (VR)", 
+  palette = "train" 
+) + 
+  scale_fill_gradient(low = "#e8f5e9", high = "#2e7d32", 
+                      guide = guide_colourbar(barheight = unit(30, "lines"), barwidth = unit(1, "lines")))
+
+print(p_cm_svm_radial)
+ggsave(filename = file.path(svm_dir, "SVM_Radial_CM_Final.tiff"), plot = p_cm_svm_radial, 
+       width = 8, height = 8, dpi = 300, compression = "lzw")
+
+#  CARET SVM (WITH CV) 
+levels(y_svm) <- make.names(levels(y_svm)) # Standardize levels for caret (CNS_1, CNS_2_3)
+
+set.seed(123)
+train_control_CNS <- trainControl(method = "cv", number = 5, classProbs = TRUE, savePredictions = "final")
+svm_fit_CNS <- train(x = x_svm, y = y_svm, method = "svmRadial", trControl = train_control_CNS, tuneLength = 5)
+
+# Save Tuning Plot
+while (!is.null(dev.list())) dev.off()
+tiff(filename = file.path(svm_dir, "SVM_Tuning_Results.tiff"), 
+     width = 10, height = 8, units = "in", res = 300)
+print(plot(svm_fit_CNS, 
+           main = "Grid Search Results for SVM Radial Model (Accuracy vs Parameters)",
+           sub = "Cross-Validation Accuracy across different Sigma and Cost values"))
+dev.off()
+
+# FEATURE SELECTION (RFE) 
+set.seed(123)
+rfe_control_CNS <- rfeControl(functions = caretFuncs, method = "cv", number = 5)
+
+svm_profile_CNS <- rfe(
+  x = x_svm, y = y_svm,
+  sizes = seq(5, ncol(x_svm), 5),
+  rfeControl = rfe_control_CNS,
+  method = "svmRadial",   
+  tuneLength = 3
+)
+
+print(svm_profile_CNS)
+capture.output(print(svm_profile_CNS), file = file.path(svm_dir, "SVM_RFE_Report.txt"))
+
+# EVALUATE RFE RESULTS 
+rfe_preds <- predict(svm_profile_CNS, x_svm)
+rfe_acc <- mean(rfe_preds == y_svm)
+
+p_cm_rfe <- plot_cm(
+  cm = list(table = as.table(table(Predicted = rfe_preds, Actual = y_svm))), 
+  title = "SVM-RFE Optimized Confusion Matrix", 
+  acc = round(rfe_acc, 3), 
+  subtitle = paste("Based on the top", svm_profile_CNS$optsize, "selected proteins (VR)"), 
+  palette = "train" 
+) + 
+  scale_fill_gradient(low = "#e8f5e9", high = "#2e7d32", 
+                      guide = guide_colourbar(barheight = unit(30, "lines"), barwidth = unit(1, "lines")))
+
+print(p_cm_rfe)
+ggsave(filename = file.path(svm_dir, "SVM_RFE_Final_CM.tiff"), plot = p_cm_rfe, 
+       width = 8, height = 8, dpi = 300, compression = "lzw")
+
+# Retrain model using selected features from RFE 
+selected_features <- predictors(svm_profile_CNS)
+cat("Number of selected features:", length(selected_features), "\n")
+
+x_selected <- x_svm[, selected_features, drop = FALSE]
+
+set.seed(123)
+svm_fit_selected <- train(
+  x = x_selected,
+  y = y_svm,
+  method = "svmRadial",
+  trControl = train_control_CNS,
+  tuneLength = 5
+)
+
+print(svm_fit_selected)
+write.csv(svm_fit_selected$bestTune, file = file.path(svm_dir, "SVM_Best_Parameters_Final.csv"), row.names = FALSE)
+
+svm_importance <- varImp(svm_fit_selected, scale = FALSE)
+write.csv(svm_importance$importance, file = file.path(svm_dir, "SVM_Feature_Importance.csv"))
+
+# check sizes
+cat("Number of rows (samples):", nrow(x_svm), "\n")
+cat("Number of columns (features):", ncol(x_svm), "\n")
+
+rfe_sizes <- seq(5, ncol(x_svm), 5) 
+write.csv(data.frame(RFE_Tested_Sizes = rfe_sizes), file = file.path(svm_dir, "RFE_Tested_Sizes.csv"), row.names = FALSE)
+
+x_df_CNS <- as.data.frame(x_svm) 
+colnames(x_df_CNS) <- make.names(colnames(x_df_CNS), unique = TRUE)
+
+#  Extract top ranked features 
+imp_CNS_svm <- caret::varImp(svm_profile_CNS$fit, scale = FALSE)
+feature_ranks_CNS <- imp_CNS_svm$importance
+feature_ranks_CNS$Feature <- rownames(feature_ranks_CNS)
+
+if ("Overall" %in% colnames(feature_ranks_CNS)) {
+  score_CNS <- feature_ranks_CNS[["Overall"]]
+} else {
+  score_CNS <- rowMeans(as.matrix(feature_ranks_CNS[, setdiff(colnames(feature_ranks_CNS), "Feature"), drop = FALSE]), na.rm = TRUE)
+}
+
+ord_CNS <- order(-score_CNS)
+feature_ranks_CNS <- feature_ranks_CNS[ord_CNS, , drop = FALSE]
+
+k_CNS <- 25 
+top25_features_CNS <- rownames(feature_ranks_CNS)[seq_len(k_CNS)]
+top25_df <- feature_ranks_CNS[1:k_CNS, , drop = FALSE]
+
+write.csv(top25_df, file = file.path(svm_dir, "SVM_Top25_Features_List.csv"), row.names = TRUE)
+
+importance_selected_CNS <- top25_df
+if(!"Importance" %in% colnames(importance_selected_CNS)) {
+  importance_selected_CNS$Importance <- score_CNS[1:k_CNS]
+}
+
+# Plot Top 25
+p_CNS_plots <- ggplot(importance_selected_CNS, aes(x = Importance, y = reorder(Feature, Importance))) +
+  geom_point(aes(size = Importance), color = "#1271c9") +
+  scale_size_continuous(name = "SVM Importance", range = c(2, 8)) +
+  theme_light() + xlab("SVM Feature Importance") + ylab("Proteins") +
+  ggtitle("Top 25 features selected_CNS_SVM-RFE (VR)") +
+  theme(
+    axis.text.y = element_text(color = "black", size = 18),
+    axis.text.x = element_text(color = "black", size = 18),
+    axis.title = element_text(size = 18),
+    legend.text = element_text(color = "black", size = 18),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA),
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )
+print(p_CNS_plots)
+ggsave(filename = file.path(svm_dir, "p_CNS_Top25.tiff"), plot = p_CNS_plots, width = 10, height = 8, dpi = 300)
+
+# Top 10 for plotting
+importance_top10_CNS <- importance_selected_CNS %>% slice_head(n = 10)
+
+p_top10_CNS_svm <- ggplot(importance_top10_CNS, aes(x = Importance, y = reorder(Feature, Importance))) +
+  geom_point(aes(size = Importance), color = "#1271c9") +
+  scale_size_continuous(name = "SVM Importance", range = c(2, 8), guide = guide_legend(override.aes = list(color = "#1271c9"))) +
+  theme_light() + xlab("SVM Feature Importance") + ylab("Proteins") +
+  ggtitle("Top important proteins_SVM_RFE_VR") +
+  theme(
+    axis.text.y = element_text(color = "black", size = 18),
+    axis.text.x = element_text(color = "black", size = 18),
+    axis.title = element_text(size = 18),
+    legend.text = element_text(color = "black", size = 18),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA),
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )
+print(p_top10_CNS_svm)
+ggsave(filename = file.path(svm_dir, "p_top10_CNS.tiff"), plot = p_top10_CNS_svm, width = 10, height = 8, dpi = 300)
+
+# Heatmap SVM
+top10_features_CNS_svm <- as.character(importance_top10_CNS$Feature)
+group_vec_CNS_svm <- final_data_ML$CNS_Target
+order_idx_CNS_svm <- order(group_vec_CNS_svm)
+
+group_ordered_CNS_svm <- group_vec_CNS_svm[order_idx_CNS_svm]
+patient_ids_CNS_svm   <- final_data_ML$PatientID[order_idx_CNS_svm]
+
+top10_features_CNS_svm <- intersect(top10_features_CNS_svm, colnames(final_data_ML))
+mat_CNS_svm <- final_data_ML[order_idx_CNS_svm, top10_features_CNS_svm, drop = FALSE]
+mat_CNS_svm <- mat_CNS_svm[, sapply(mat_CNS_svm, is.numeric), drop = FALSE]
+mat_CNS_svm <- as.matrix(mat_CNS_svm)
+
+heatmap_data_CNS_svm <- t(scale(mat_CNS_svm))
+colnames(heatmap_data_CNS_svm) <- patient_ids_CNS_svm
+
+group_colors_svm <- c("CNS_1" = "#ff704d", "CNS_2_3" = "#668cff")
+annotation_col_CNS_svm <- HeatmapAnnotation(Groups = group_ordered_CNS_svm, col = list(Groups = group_colors_svm), annotation_name_side = "right")
+
+ht_CNS_svm <- Heatmap(
+  heatmap_data_CNS_svm,
+  name = "NPX",
+  top_annotation = annotation_col_CNS_svm,
+  cluster_columns = FALSE,
+  show_column_names = TRUE,
+  column_names_rot = 90,
+  column_names_gp = gpar(fontsize = 8),
+  row_names_gp = gpar(fontsize = 20),
+  column_title = "SVM Selected Top 10 Features (CNS Target - VR)",
+  column_title_gp = gpar(fontsize = 18, fontface = "bold"),
+  heatmap_legend_param = list(title_gp = gpar(fontsize = 18, fontface = "plain"))
+)
+
+tiff(file.path(svm_dir, "SVM_Heatmap_Top.tiff"), width = 1200, height = 1000, res = 120)
+draw(ht_CNS_svm, heatmap_legend_side = "right", annotation_legend_side = "right")
+dev.off()
+
+#*******************
+#  Venn Diagram 
+#*******************
+
+lasso_proteins_CNS <- unique(as.character(lasso_selected_proteins_CNS))
+lasso_proteins_CNS <- lasso_proteins_CNS[!is.na(lasso_proteins_CNS) & lasso_proteins_CNS != ""]
+
+rf_proteins_CNS <- unique(as.character(top10_selected_RF_CNS$Feature))
+rf_proteins_CNS <- rf_proteins_CNS[!is.na(rf_proteins_CNS) & rf_proteins_CNS != ""]
+
+svm_proteins_CNS <- unique(as.character(importance_top10_CNS$Feature))
+svm_proteins_CNS <- svm_proteins_CNS[!is.na(svm_proteins_CNS) & svm_proteins_CNS != ""]
+
+cats <- c("RF", "LASSO", "SVM")
+feature_lists <- list(RF = rf_proteins_CNS, LASSO = lasso_proteins_CNS, SVM = svm_proteins_CNS)
+cols <- c(RF = "#984ea3", LASSO = "#4daf4a", SVM = "#d95f02")
+
+category_labels <- paste0(cats, " (", sapply(feature_lists[cats], length), ")")
+
+venn.plot <- venn.diagram(
+  x = feature_lists[cats],
+  filename = NULL,
+  col = "transparent",
+  fill = cols[cats],
+  alpha = 0.50,
+  cex = 3.5,
+  fontfamily = "Arial",
+  cat.cex = 2.2,
+  cat.fontfamily = "Arial",
+  cat.col = cols[cats],
+  category.names = category_labels,
+  main = "Proteins selected by models (RF/LASSO/SVM) — CNS Target (VR)",
+  main.cex = 1,
+  main.fontface = "bold",
+  main.fontfamily = "Arial",
+  scaled = FALSE,
+  euler.d = FALSE,
+  rotation.degree = 0
+)
+
+tiff(filename = file.path(main_dir, "Venn_1_All_Models.tiff"), width = 12, height = 12, units = "in", res = 300)
+grid::grid.newpage()
+grid::grid.draw(venn.plot)
+dev.off()
+
+# Extract Shared lists 
+selected_RF    <- rf_proteins_CNS
+selected_LASSO <- lasso_proteins_CNS
+selected_SVM   <- svm_proteins_CNS
+
+RF_only    <- setdiff(selected_RF, union(selected_LASSO, selected_SVM))
+LASSO_only <- setdiff(selected_LASSO, union(selected_RF, selected_SVM))
+SVM_only   <- setdiff(selected_SVM, union(selected_RF, selected_LASSO))
+
+RF_LASSO  <- setdiff(intersect(selected_RF, selected_LASSO), selected_SVM)
+RF_SVM    <- setdiff(intersect(selected_RF, selected_SVM), selected_LASSO)
+LASSO_SVM <- setdiff(intersect(selected_LASSO, selected_SVM), selected_RF)
+
+common_three <- Reduce(intersect, list(selected_RF, selected_LASSO, selected_SVM))
+
+# Exporting text report of Venn
+sink(file.path(main_dir, "Venn_Proteins_Summary.txt"))
+cat("RF only:", RF_only, "\n\nLASSO only:", LASSO_only, "\n\nSVM only:", SVM_only, "\n\n")
+cat("RF and LASSO shared:", RF_LASSO, "\n\nRF and SVM shared:", RF_SVM, "\n\nLASSO and SVM shared:", LASSO_SVM, "\n\n")
+cat("Common to all three:", common_three, "\n")
+sink()
+
+# Unique shared intersections vector
+nselect <- unique(c(RF_LASSO, RF_SVM, LASSO_SVM, common_three))
+
+
+# HEATMAP & ML VALIDATION FOR INTERSECTED/COMMON PROTEINS
+
+if(length(nselect) > 0) {
+  nselect_heatmap_data <- final_data_ML[, nselect, drop = FALSE]
+  order_idx_cns_final <- order(final_data_ML$CNS_Target)
+  nselect_heatmap_data <- nselect_heatmap_data[order_idx_cns_final, ]
+  group_ordered_cns_final <- final_data_ML$CNS_Target[order_idx_cns_final]
+  
+  nselect_heatmap_data <- t(as.matrix(nselect_heatmap_data))
+  colnames(nselect_heatmap_data) <- final_data_ML$PatientID[order_idx_cns_final]
+  
+  ht_nselect <- Heatmap(
+    nselect_heatmap_data,
+    name = "NPX",
+    top_annotation = HeatmapAnnotation(
+      Groups = group_ordered_cns_final,
+      col = list(Groups = group_colors_svm),
+      annotation_legend_param = list(Groups = list(title = "Groups", title_gp = gpar(fontsize = 16)))
+    ),
+    cluster_columns = FALSE,
+    show_column_names = TRUE,
+    column_names_rot = 90,
+    column_names_gp = gpar(fontsize = 6), 
+    row_names_gp = gpar(fontsize = 12),
+    column_title = "Common Proteins between selected important Features (VR Samples)",
+    column_title_gp = gpar(fontsize = 16, fontface = "bold")
+  )
+  
+  tiff(filename = file.path(main_dir, "Heatmap_nselect_Top10.tiff"), width = 12, height = 10, units = "in", res = 300)
+  draw(ht_nselect, heatmap_legend_side = "right")
+  dev.off()
+  
+# ML Validation on Intersected Proteins
+  current_features <- intersect(nselect, colnames(final_data_ML))
+  
+  df_nselect <- final_data_ML %>% select(all_of(current_features), CNS_Target)
+  df_nselect$CNS_Target <- factor(df_nselect$CNS_Target, levels = c("CNS_1", "CNS_2_3"))
+  
+  set.seed(123)
+  train_idx_ns <- createDataPartition(df_nselect$CNS_Target, p = 0.8, list = FALSE)
+  train_df_ns  <- df_nselect[train_idx_ns, ]
+  test_df_ns   <- df_nselect[-train_idx_ns, ]
+  
+  subtitle_nselect <- paste(current_features, collapse = ", ")
+  
+  model_nselect <- train(
+    CNS_Target ~ ., data = train_df_ns, method = "svmRadial",
+    trControl = trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = multiClassSummary)
+  )
+  
+  cm_train_ns <- confusionMatrix(predict(model_nselect, train_df_ns), train_df_ns$CNS_Target)
+  cm_test_ns  <- confusionMatrix(predict(model_nselect, test_df_ns), test_df_ns$CNS_Target)
+  
+  ggsave(file.path(main_dir, "CM_Top10_Train.tiff"), plot = plot_cm(cm_train_ns, "Training CM (Intersection Model)", round(cm_train_ns$overall["Accuracy"], 3), subtitle = subtitle_nselect, palette = "train"), width = 7, height = 6)
+  ggsave(file.path(main_dir, "CM_Top10_Test.tiff"), plot = plot_cm(cm_test_ns, "Test CM (Intersection Model)", round(cm_test_ns$overall["Accuracy"], 3), subtitle = subtitle_nselect, palette = "test"), width = 7, height = 6)
+} else {
+  cat("No overlapping features found between models to perform intersection heatmap/validation.\n")
+}
+
+cat("All integrated pipelines completed successfully for CNS_1 vs CNS_2_3 on VR samples!\n")
+
+
+# PREPARE DATA FOR MACHINE LEARNING 
+current_features <- intersect(nselect, colnames(final_data_ML))
+df_nselect <- final_data_ML %>% select(all_of(current_features), CNS_Target)
+
+#Standardize class names for internal R variable compliance
+df_nselect$CNS_Target <- factor(df_nselect$CNS_Target)
+levels(df_nselect$CNS_Target) <- make.names(levels(df_nselect$CNS_Target))
+
+x_ns <- as.matrix(df_nselect[, current_features, drop = FALSE])
+y_ns <- df_nselect$CNS_Target
+storage.mode(x_ns) <- "numeric"
+
+#LEAVE-ONE-OUT CROSS-VALIDATION (LOOCV) PIPELINE 
+set.seed(123)
+n_ns <- nrow(x_ns)
+ns_loocv_preds <- factor(levels = levels(y_ns))
+
+for (i in 1:n_ns) {
+  x_train_i <- x_ns[-i, , drop = FALSE]
+  y_train_i <- y_ns[-i]
+  x_test_i  <- x_ns[i, , drop = FALSE]
+  
+# Train SVM Radial on N-1 samples
+  svm_i <- svm(x_train_i, y_train_i, kernel = "radial", cost = 1, gamma = 1/ncol(x_ns))
+  ns_loocv_preds[i] <- predict(svm_i, newdata = x_test_i)
+}
+
+# Restore official factor levels
+levels(ns_loocv_preds) <- c("CNS_1", "CNS_2_3")
+levels(y_ns)           <- c("CNS_1", "CNS_2_3")
+
+# Calculate Performance Metrics
+ns_loocv_conf <- table(Predicted = ns_loocv_preds, Actual = y_ns)
+ns_loocv_acc  <- mean(ns_loocv_preds == y_ns)
+
+# Save raw confusion matrix to CSV
+write.csv(as.data.frame.matrix(ns_loocv_conf), file = file.path(main_dir, "Intersection_Model_LOOCV_Matrix.csv"))
+
+# PLOT AND SAVE THE LOOCV CONFUSION MATRIX ---
+subtitle_nselect <- paste(current_features, collapse = ", ")
+
+p_cm_ns_loocv <- plot_cm(
+  cm = list(table = as.table(ns_loocv_conf)), 
+  title = "Intersection Model LOOCV Confusion Matrix", 
+  acc = round(ns_loocv_acc, 3), 
+  subtitle = paste("LOOCV using shared proteins:", subtitle_nselect), 
+  palette = "test"
+)
+
+print(p_cm_ns_loocv)
+ggsave(file.path(main_dir, "CM_Intersection_LOOCV.tiff"), plot = p_cm_ns_loocv, width = 8, height = 7, dpi = 300, compression = "lzw")
+
+
+
+cat("All integrated pipelines completed successfully with unified LOOCV validation!\n")
+
+
+
+# BOOTSTRAP SCREENING FOR VD SAMPLE
+
+
+# FUNCTION DEFINITION (Stratified for CNS_Target)
+run_svm_bootstrap <- function(list_of_prots, data, n_boot = 1000) {
+  final_res <- data.frame()
+  
+#  Ensure target is a strict factor with standard compliance
+  data$CNS_Target <- factor(data$CNS_Target)
+  levs <- levels(data$CNS_Target)
+  pos_class <- make.names(levs[2])
+  levels(data$CNS_Target) <- make.names(levs)
+  
+  for (group_name in names(list_of_prots)) {
+    p <- list_of_prots[[group_name]]
+    if(length(p) == 0) next
+    
+    boot_aucs <- numeric(n_boot)
+    cat("Processing Group (VD):", group_name, "\n")
+    
+# Separate indices by class for stratified sampling
+    idx_class1 <- which(data$CNS_Target == levels(data$CNS_Target)[1])
+    idx_class2 <- which(data$CNS_Target == levels(data$CNS_Target)[2])
+    
+    set.seed(12345)
+    for (i in 1:n_boot) {
+# STRATIFIED SAMPLING - Sample within each class separately
+      train_idx1 <- sample(idx_class1, replace = TRUE)
+      train_idx2 <- sample(idx_class2, replace = TRUE)
+      train_idx  <- c(train_idx1, train_idx2)
+      
+      train_set <- data[train_idx, ]
+      oob_idx   <- setdiff(1:nrow(data), unique(train_idx))
+      test_set  <- data[oob_idx, ]
+      
+#  Safety check to guarantee both classes exist in OOB
+      if(length(unique(test_set$CNS_Target)) < 2) {
+        missing_from_oob <- setdiff(1:nrow(data), oob_idx)
+        extra_1 <- sample(intersect(missing_from_oob, idx_class1), 1)
+        extra_2 <- sample(intersect(missing_from_oob, idx_class2), 1)
+        test_set <- rbind(test_set, data[c(extra_1, extra_2), ])
+      }
+      
+# SVM Radial Model
+      svm_fit <- e1071::svm(CNS_Target ~ ., 
+                            data = train_set[, c(p, "CNS_Target")], 
+                            kernel = "radial", 
+                            probability = TRUE)
+      
+# OOB Prediction
+      pred <- predict(svm_fit, test_set[, p], probability = TRUE)
+      probs <- attr(pred, "probabilities")
+      prob_scores <- probs[, pos_class]
+      
+# Calculate OOB AUC safely
+      roc_obj <- tryCatch(pROC::roc(test_set$CNS_Target, prob_scores, quiet = TRUE), error = function(e) NULL)
+      if(!is.null(roc_obj)) {
+        boot_aucs[i] <- as.numeric(roc_obj$auc)
+      } else {
+        boot_aucs[i] <- NA
+      }
+    }
+    
+    valid_aucs <- boot_aucs[!is.na(boot_aucs)]
+    if(length(valid_aucs) == 0) valid_aucs <- c(0.5)
+    
+    final_res <- rbind(final_res, data.frame(
+      Group = group_name,
+      N = length(p),
+      Mean_OOB_AUC = round(mean(valid_aucs), 3),
+      SD_AUC = round(sd(valid_aucs), 3),
+      CI_Lower = round(quantile(valid_aucs, 0.025), 3),
+      CI_Upper = round(quantile(valid_aucs, 0.975), 3),
+      Proteins = paste(sort(p), collapse = ", ")
+    ))
+  }
+  return(final_res)
+}
+
+
+# Initial Setup - Dynamic Core and Candidates for VD
+
+selected_RF    <- unique(as.character(top10_selected_RF_CNS$Feature))
+selected_SVM   <- unique(as.character(importance_top10_CNS$Feature))
+
+#  Core is the intersection of RF and SVM (LASSO is 0 for VD)
+core <- intersect(selected_RF, selected_SVM) 
+all_selected_prots <- unique(c(selected_RF, selected_SVM))
+candidates_to_test <- setdiff(all_selected_prots, core)
+
+cat("Core proteins (Shared RF & SVM, n =", length(core), "):", paste(core, collapse=", "), "\n")
+cat("Candidates for 5+1 screening (n =", length(candidates_to_test), "):", paste(candidates_to_test, collapse=", "), "\n")
+
+# Step 1: Calculating Baseline for Core (OOB)
+
+cat("\n--- Step 1: Calculating Baseline for Core ---\n")
+core_boot_res <- run_svm_bootstrap(list(Core_Only = core), final_data_ML_scaled, n_boot = 1000)
+base_auc <- core_boot_res$Mean_OOB_AUC
+cat("Baseline AUC (Core Only):", base_auc, "\n")
+
+
+# Step 2: Phase 1 - Screening (Core + 1)
+
+cat("\n--- Step 2: Phase 1 - Screening (Each Candidate + Core) ---\n")
+screening_list <- list()
+for(prot in candidates_to_test) {
+  screening_list[[prot]] <- unique(c(core, prot))
+}
+
+phase1_results <- run_svm_bootstrap(screening_list, final_data_ML_scaled, n_boot = 1000)
+phase1_output <- rbind(core_boot_res, phase1_results) %>% arrange(desc(Mean_OOB_AUC))
+
+write_xlsx(phase1_output, file.path(main_dir, "Phase1_Screening_Results_VD.xlsx"))
+print(head(phase1_output, 10))
+
+
+# Step 3: Filter Winners & Build Final Combinations
+
+winners <- phase1_output %>% 
+  filter(Mean_OOB_AUC > base_auc & Group != "Core_Only") %>% 
+  pull(Group)
+
+cat("\nWinners that improved the Core:", paste(winners, collapse=", "), "\n")
+
+final_combos <- list(Core_Only = core)
+if(length(winners) > 0) {
+  for(i in 1:length(winners)) {
+    cmb <- combn(winners, i, simplify = FALSE)
+    for(j in seq_along(cmb)) {
+      name <- paste0("Core_plus_", i, "_selected_", j)
+      final_combos[[name]] <- unique(c(core, cmb[[j]]))
+    }
+  }
+}
+
+# Step 4: Phase 2 - Final Evaluation
+
+cat("\n--- Step 4: Phase 2 - Evaluating Winning Combinations ---\n")
+set.seed(123)
+phase2_results <- run_svm_bootstrap(final_combos, final_data_ML_scaled, n_boot = 1000)
+
+phase2_results <- phase2_results %>% arrange(desc(Mean_OOB_AUC))
+write_xlsx(phase2_results, file.path(main_dir, "Phase2_Final_Combinations_Results_VD.xlsx"))
+
+print(head(phase2_results, 10))
+
+
+# Joining to table together
+
+final_report_ordered <- bind_rows(
+  phase1_output %>% mutate(Phase = "Phase 1"),
+  phase2_results %>% mutate(Phase = "Phase 2") 
+) %>% 
+  distinct(Proteins, .keep_all = TRUE) 
+
+
+final_report_clean <- final_report_ordered %>%
+  rowwise() %>%
+  mutate(
+    Proteins = {
+      prots <- unlist(strsplit(Proteins, ", "))
+      prots_final <- ifelse(prots %in% core, paste0("[", prots, "]"), prots)
+      paste(sort(prots_final), collapse = ", ")
+    }
+  ) %>%
+#Coloumn selection
+  select(Phase, Group, N, Mean_OOB_AUC, Proteins) %>%
+  arrange(Phase, desc(Mean_OOB_AUC))
+
+library(writexl)
+write_xlsx(final_report_clean, file.path(main_dir, "Ordered_Phases_Report.xlsx"))
+
+
+#draw graphs
+boot_selected <- c("CAIX", "CASP_8", "HAGH", "CXCL9", "MMP7", "MCP_2", "VWC2")
+
+group_vec_cns <- ifelse(final_data_ML$Group_CNS_Involvement %in% c("2", "3"), "CNS2+3", "CNS1")
+
+order_idx_cns_final <- order(group_vec_cns)
+group_ordered_cns_final <- group_vec_cns[order_idx_cns_final]
+
+my_colors <- c("CNS1" = "#ff704d", "CNS2+3" = "#668cff")
+
+nselect_heatmap_data <- final_data_ML[order_idx_cns_final, boot_selected, drop = FALSE]
+nselect_heatmap_data <- t(as.matrix(nselect_heatmap_data))
+colnames(nselect_heatmap_data) <- final_data_ML$PatientID[order_idx_cns_final]
+
+ht_nselect <- Heatmap(
+  nselect_heatmap_data,
+  name = "NPX",
+  top_annotation = HeatmapAnnotation(
+    Groups = group_ordered_cns_final,
+    col = list(Groups = my_colors),
+    annotation_legend_param = list(Groups = list(title = "Groups", title_gp = gpar(fontsize = 16)))
+  ),
+  cluster_columns = FALSE,
+  show_column_names = TRUE,
+  column_names_rot = 90,
+  column_names_gp = gpar(fontsize = 6), 
+  row_names_gp = gpar(fontsize = 12),
+  column_title = "CNS1_Vs_2+3_VR",
+  column_title_gp = gpar(fontsize = 16, fontface = "bold")
+)
+
+file_path_heatmap <- "Boot_ProteinsCNS.png"
+png(file_path_heatmap, width = 1200, height = 900, res = 150)
+draw(ht_nselect)
+dev.off()
