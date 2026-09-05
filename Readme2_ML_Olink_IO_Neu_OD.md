@@ -25,7 +25,7 @@ The script processes data sequentially through two primary analytical modules:
 
 🛠️ Installation & Dependencies
 Ensure you have the required R packages installed before executing the script. You can initialize them by running:
-Rinstall.packages(c("tidyverse", "readxl", "randomForest", "pROC", "glmnet", "e1071", "caret", "VennDiagram", "writexl"))
+Rinstall. packages(c("tidyverse", "readxl", "randomForest", "pROC", "glmnet", "ComplexHeatmap", "grid", "circlize", "e1071", "caret", "VennDiagram", "writexl", "mixomics"))
 
 if (!require("BiocManager", quietly = TRUE))
     install.packages("BiocManager")
