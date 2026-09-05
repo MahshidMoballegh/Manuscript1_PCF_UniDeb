@@ -319,7 +319,6 @@ plot_summary_trajectory <- function(df, target_prots, filename = "Summary_Trajec
     facet_wrap(~Protein, scales = "free_y", 
                ncol = if(length(target_prots) > 5) 5 else length(target_prots)) +
     # Custom color scale: Female -> Red, Male -> Blue
-    # Note: Ensure these strings match exactly with your data (e.g., "Female" or "female")
     scale_color_manual(values = c("F" = "red", 
                                   "M"   = "blue")) +
     theme_bw() +
