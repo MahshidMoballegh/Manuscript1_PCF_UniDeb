@@ -48,7 +48,7 @@ final_data_ML$Group_CNS_Involvement <-   as.numeric(as.character(unlist(final_da
  
  print("Columns that are STILL not numeric:")
  print(names(final_data_ML)[!sapply(final_data_ML, is.numeric)])
- main_dir <- "MachineLearning_EVA"
+ main_dir <- "MachineLearning"
  dir.create(main_dir, showWarnings = FALSE)
  # Create subdirectories for each model type
  rf_dir <- file.path(main_dir, "RF")
