@@ -27,8 +27,6 @@ Disease Type, Gender, and
 CNS Levels 1, 2, and 3    
 
 
-
-
 🔬 Statistical Methodology & Parameters
 
 Pre-processing & Quality Control
@@ -36,7 +34,10 @@ Missing Data Handling:Samples with entirely missing data across all proteomic as
 Log2 Fold Change (FC): Since Olink NPX values are delivered on a log_2scale, the Normalized Fold Change is computed directly as the difference between group medians: Delta NPX = median(X) - median(Y).
 
 Hypothesis Testing & Multiple Testing Correction
-Univariate Testing: Group comparisons are conducted using the non-parametric Wilcoxon Rank-Sum Test , ensuring robustness against non-normally distributed proteomic expression values.
+Univariate Testing: 
+Group comparisons are conducted using non-parametric Wilcoxon tests, ensuring robustness against non-normally distributed proteomic expression values:
+- Paired Wilcoxon Signed-Rank Test for longitudinal comparisons across paired timepoints (e.g., VR vs VD within the same patients).
+- Unpaired Wilcoxon Rank-Sum Test (Mann-Whitney U) for cross-sectional comparisons between independent cohorts (e.g., T-ALL vs B-ALL, Gender, and CNS Subgroups).
 FDR Management: Multiple testing correction is handled via Storey's `qvalue` package to maintain high statistical power. The script automatically falls back to standard Benjamini-Hochberg (FDR) adjustment if the q-value optimization target fails to converge due to highly flat or restricted p-value distributions.
 Significance Thresholds: Features are isolated using strict custom logical limits:
   - `FC_THRESHOLD <- 0.5` (|Log2FC| > 0.5)
