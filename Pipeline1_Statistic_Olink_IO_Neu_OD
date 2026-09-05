@@ -1,27 +1,21 @@
+library(tidyverse)
 library(readxl)
-library(readr)
+library(ggrepel)
+library(ComplexHeatmap)
+library(ggplot2)
 library(dplyr)
 library(tidyr)
-library(ggplot2)
-library(ggrepel)
-library(qvalue)
-library(tibble)
-library(purrr)
-library(ComplexHeatmap)
-library(grid)
-
-
-#===============================================================VD Vs VR================================================================================
-
+library(readr)
 
 #***************************
-#      LOAD DATA
+#       LOAD DATA
 #***************************
-final_data_3 <- read_excel("Final_data_3.xlsx")
+Final_data_3 <- read_excel("Final_data_3.xlsx")
+
 meta_cols <- c("WellID","PatientID","DiseaseType","Visit","Visitcode",
                "CNS_Involvement","Group_CNS_Involvement","Gender")
-assays <- setdiff(colnames(final_data_3), meta_cols)
-data <- final_data_3 %>%
+assays <- setdiff(colnames(Final_data_3), meta_cols)
+data <- Final_data_3 %>%
   filter(rowSums(!is.na(select(., all_of(assays)))) > 0)
 
 #***************************
@@ -49,49 +43,72 @@ dir.create(DIR_HEATMAP, showWarnings = FALSE)
 #***************************
 #    CORE FUNCTION
 #***************************
-run_comparison <- function(df, group_col, g1, g2, label){
+# Added 'paired' argument (default FALSE). Set to TRUE for longitudinal comparisons.
+run_comparison <- function(df, group_col, g1, g2, label, paired = FALSE){
   
   res <- lapply(assays, function(a){
-    x <- df %>% filter(.data[[group_col]] == g1) %>% pull(a) %>% na.omit()
-    y <- df %>% filter(.data[[group_col]] == g2) %>% pull(a) %>% na.omit()
     
-# Check if we have enough samples for Wilcoxon test
-    if(length(x) < 2 | length(y) < 2) return(NULL)
-    
-    wt <- wilcox.test(x, y)
+    if(paired){
+      # For paired comparisons (e.g., VR vs VD across the same patients):
+      # Match patients having data for both timepoints
+      sub_df <- df %>%
+        filter(.data[[group_col]] %in% c(g1, g2)) %>%
+        select(PatientID, .data[[group_col]], all_of(a)) %>%
+        pivot_wider(names_from = .data[[group_col]], values_from = all_of(a), values_fn = mean) %>%
+        drop_na(all_of(g1), all_of(g2))
+      
+      # Check if we have enough paired samples for Wilcoxon test
+      if(nrow(sub_df) < 2) return(NULL)
+      
+      x <- sub_df[[g1]]
+      y <- sub_df[[g2]]
+      
+      # Perform paired Wilcoxon signed-rank test
+      wt <- wilcox.test(x, y, paired = TRUE)
+      
+      # Calculate median of paired differences for Log2FC
+      log2fc <- median(x - y, na.rm = TRUE)
+      
+    } else {
+      # For unpaired comparisons (e.g., Female vs Male within one visit)
+      x <- df %>% filter(.data[[group_col]] == g1) %>% pull(a) %>% na.omit()
+      y <- df %>% filter(.data[[group_col]] == g2) %>% pull(a) %>% na.omit()
+      
+      if(length(x) < 2 | length(y) < 2) return(NULL)
+      
+      # Perform unpaired Wilcoxon rank-sum test
+      wt <- wilcox.test(x, y, paired = FALSE)
+      log2fc <- median(x) - median(y)
+    }
     
     data.frame(
       Assay = a,
       pvalue = wt$p.value,
-      Log2FC = median(x) - median(y) # NPX values are on log2 scale → median difference equals log2 fold change
+      Log2FC = log2fc
     )
   })
   
   res <- bind_rows(res)
-
-# Q-VALUE CALCULATION
-
+  if(is.null(res) || nrow(res) == 0) return(NULL)
+  
+  # Q-VALUE CALCULATION
   if(nrow(res) > 1){
     res$qvalue <- tryCatch({
-# Using qvalue package for more accurate FDR estimation in Omics data
       qobj <- qvalue::qvalue(res$pvalue)
       qobj$qvalues
     }, error = function(e) {
-# Fallback to standard FDR if qvalue fails (e.g., due to low sample size/flat distribution)
       message("qvalue failed, falling back to p.adjust (FDR)")
       p.adjust(res$pvalue, method = "fdr")
     })
   } else {
     res$qvalue <- res$pvalue
-  
   }
   
   write.csv(res, file.path(DIR_TABLES, paste0(label, ".csv")), row.names = FALSE)
   
-#***************************
-#   VOLCANO
-#***************************
-
+  #***************************
+  #    VOLCANO
+  #***************************
   plot_df <- res %>%
     mutate(
       status = case_when(
@@ -106,11 +123,18 @@ run_comparison <- function(df, group_col, g1, g2, label){
     geom_jitter(data = filter(plot_df, status == "Not Significant"), 
                 width = 0.1, height = 0.05, alpha = 0.7, size = 2, color = "gray10") +
     geom_point(data = filter(plot_df, status != "Not Significant"), size = 3, alpha = 0.8) +
-    geom_text_repel(aes(label = label_text), max.overlaps = 10, size=6) +
+    geom_text_repel(
+      aes(label = label_text), 
+      max.overlaps = Inf,
+      size = 3,
+      box.padding = 0.5,
+      point.padding = 0.3,
+      segment.color = "gray50",
+      segment.size = 0.3
+    )  +
     geom_vline(xintercept = c(-FC_THRESHOLD, FC_THRESHOLD), linetype = "dotted") +
     geom_hline(yintercept = -log10(Q_THRESHOLD), linetype = "dashed") +
-    scale_color_manual(values = c("Increased"="red",
-                                  "Decreased"="blue"),
+    scale_color_manual(values = c("Increased"="red", "Decreased"="blue"),
                        breaks = c("Increased", "Decreased")) +
     theme_bw() +
     labs(title = label, x = "Log2 Fold Change", y = "-log10(q-value)") +
@@ -127,19 +151,18 @@ run_comparison <- function(df, group_col, g1, g2, label){
   ggsave(file.path(DIR_VOLCANO, paste0(label, "_volcano.png")),
          p, width = 8, height = 6)
   
-#***************************
-#  SIGNIFICANT PROTEINS
-#***************************
-
+  #***************************
+  #  SIGNIFICANT PROTEINS
+  #***************************
   sig_prots <- plot_df %>%
     filter(status != "Not Significant") %>%
     pull(Assay)
   
   if(length(sig_prots) == 0) return(NULL)
   
-#***************************
-#        BOXPLOTS
-#***************************
+  #***************************
+  #        BOXPLOTS
+  #***************************
   long_df <- df %>%
     select(PatientID, all_of(group_col), all_of(sig_prots)) %>%
     pivot_longer(-c(PatientID, all_of(group_col)),
@@ -165,29 +188,25 @@ run_comparison <- function(df, group_col, g1, g2, label){
   
   ggsave(file.path(DIR_BOXPLOT, paste0(label, "_boxplot.png")), bp, width = 10, height = 8)
   
-#***************************
-#    HEATMAP
-#***************************
-# Prepare heatmap dataframe
+  #***************************
+  #    HEATMAP
+  #***************************
   heat_df <- df %>%
     select(PatientID, Visitcode, all_of(sig_prots)) %>%
     mutate(SampleID = paste(PatientID, Visitcode, sep = "_"))
   
-# Build matrix
   mat <- heat_df %>%
     select(-PatientID, -Visitcode) %>%
     column_to_rownames("SampleID") %>%
     as.matrix() %>%
     t()
   
-# Remove zero-variance rows
   mat <- mat[
     apply(mat, 1, function(x) sd(x, na.rm = TRUE) > 0),
     ,
     drop = FALSE
   ]
   
-# Order samples by Visitcode
   sample_info <- heat_df %>%
     filter(SampleID %in% colnames(mat)) %>%
     arrange(Visitcode)
@@ -199,14 +218,12 @@ run_comparison <- function(df, group_col, g1, g2, label){
   )
   rownames(annotation_col) <- sample_info$SampleID
   
-# Safety check
   if (nrow(mat) < 2 || ncol(mat) < 2) {
     message("Heatmap skipped: matrix too small")
     return(NULL)
   }
   
   file_path_heatmap <- file.path(DIR_HEATMAP, paste0(label, "_heatmap.png"))
-  ha <- HeatmapAnnotation(df = annotation_col)
   visit_colors <- c("VD" = "salmon", "VR" = "skyblue") 
   
   ha <- HeatmapAnnotation(
@@ -234,30 +251,75 @@ run_comparison <- function(df, group_col, g1, g2, label){
 }
 
 #***************************
-# SUMMARY TRAJECTORY FUNCTION
+# EXECUTION
 #***************************
 
+# 1. Longitudinal comparison across ALL patients (PAIRED)
+run_comparison(data, "Visitcode", "VR", "VD", "Overall_VR_vs_VD", paired = TRUE)
+
+# 2. Cross-sectional comparisons within a single visit (UNPAIRED)
+for(v in c("VD", "VR")){
+  sub_data <- data %>% filter(Visitcode == v)
+  
+  run_comparison(sub_data, "DiseaseType", "T-ALL", "B-ALL",
+                 paste0("B_vs_T_ALL_in_", v), paired = FALSE)
+  
+  run_comparison(sub_data, "Gender", "F", "M",
+                 paste0("Female_vs_Male_in_", v), paired = FALSE)
+  
+  run_comparison(sub_data, "Group_CNS_Involvement", "1", "2",
+                 paste0("CNS_1_vs_2_in_", v), paired = FALSE)
+  run_comparison(sub_data, "Group_CNS_Involvement", "1", "3",
+                 paste0("CNS_1_vs_3_in_", v), paired = FALSE)
+  run_comparison(sub_data, "Group_CNS_Involvement", "2", "3",
+                 paste0("CNS_2_vs_3_in_", v), paired = FALSE)
+}
+
+# 3. Longitudinal comparisons within Disease Types (PAIRED)
+for(dt in c("T-ALL", "B-ALL")){
+  run_comparison(data %>% filter(DiseaseType == dt),
+                 "Visitcode", "VR", "VD",
+                 paste0("Changes_VD_to_VR_in_", dt), paired = TRUE)
+}
+
+# 4. Longitudinal comparisons within Sex Subgroups (PAIRED)
+for(g in c("F", "M")){
+  run_comparison(data %>% filter(Gender == g),
+                 "Visitcode", "VR", "VD",
+                 paste0("Changes_VD_to_VR_in_", g), paired = TRUE)
+}
+
+# 5. Longitudinal comparisons within CNS Subgroups (PAIRED)
+for(cns in c("1", "2", "3")){
+  run_comparison(data %>% filter(Group_CNS_Involvement == cns),
+                 "Visitcode", "VR", "VD",
+                 paste0("Changes_VD_to_VR_in_CNS_", cns), paired = TRUE)
+}
+
+print("All comparisons completed successfully!")
+
+#***************************
+# SUMMARY TRAJECTORY FUNCTION
+#***************************
 plot_summary_trajectory <- function(df, target_prots, filename = "Summary_Trajectory.png") {
   
-# Prepare data for plotting
+  # Prepare data for plotting
   summary_df <- df %>%
-    
-# Ensure Gender is included in the selection
+    # Ensure Gender is included in the selection
     select(PatientID, Visitcode, Gender, all_of(target_prots)) %>% 
     pivot_longer(cols = all_of(target_prots), names_to = "Protein", values_to = "NPX") %>%
-    
-# Use Visitcode (VD/VR) for plotting X-axis
+    # Use Visitcode (VD/VR) for plotting X-axis
     mutate(Visit = Visitcode) 
-
   
-    p <- ggplot(summary_df, aes(x = Visit, y = NPX, group = PatientID, color = Gender)) +
+  # Plotting trajectories
+  p <- ggplot(summary_df, aes(x = Visit, y = NPX, group = PatientID, color = Gender)) +
     geom_line(size = 0.8, alpha = 0.6) +
     geom_point(color = "black", size = 1) +
-      
-#Faceting by Protein
+    # Faceting by Protein
     facet_wrap(~Protein, scales = "free_y", 
                ncol = if(length(target_prots) > 5) 5 else length(target_prots)) +
-    
+    # Custom color scale: Female -> Red, Male -> Blue
+    # Note: Ensure these strings match exactly with your data (e.g., "Female" or "female")
     scale_color_manual(values = c("F" = "red", 
                                   "M"   = "blue")) +
     theme_bw() +
@@ -270,70 +332,25 @@ plot_summary_trajectory <- function(df, target_prots, filename = "Summary_Trajec
       strip.background = element_rect(fill = "white", color = "black", size = 0.5),
       strip.text = element_text(size = 18, face = "plain"),
       legend.position = "bottom",
-      plot.title = element_text(hjust = 0.5, size = 20),      
-      axis.title = element_text(size = 18),                   
-      axis.text = element_text(color = "black", size = 18),                  
-      legend.text = element_text(size = 18),                
-      legend.title = element_text(size = 18),                 
-      panel.grid.major = element_blank(), 
-      panel.grid.minor = element_blank(), 
+      plot.title = element_text(hjust = 0.5, size = 20),      # TITLE FONT
+      axis.title = element_text(size = 18),                   # AXIS FONT SIZE
+      axis.text = element_text(color = "black", size = 18),                    # AXIS NUM SIZE
+      legend.text = element_text(size = 18),                  # LEGEND FONT SIZE
+      legend.title = element_text(size = 18),                 # LEGEND TITLE SIZE
+      panel.grid.major = element_blank(), # Eleminate the gridlines
+      panel.grid.minor = element_blank(),  # Eleminate the gridlines
       panel.border = element_rect(color = "black", fill = NA)
-      )
-
-      ggsave(file.path(ROOT_DIR, "Summary_Trajectory.png"), 
+    )
+  # Save the plot
+  ggsave(file.path(ROOT_DIR, "Summary_Trajectory.png"), 
          p, width = 15, height = 5, units = "in", dpi = 600)}
-
-#***************************
-# EXECUTION (UNCHANGED LOGIC)
-#***************************
-
-run_comparison(data, "Visitcode", "VR", "VD", "Overall_VR_vs_VD")
-
-for(v in c("VD", "VR")){
-  sub_data <- data %>% filter(Visitcode == v)
-  
-  run_comparison(sub_data, "DiseaseType", "T-ALL", "B-ALL",
-                 paste0("B_vs_T_ALL_in_", v))
-  
-  run_comparison(sub_data, "Gender", "F", "M",
-                 paste0("Female_vs_Male_in_", v))
-  
-  run_comparison(sub_data, "Group_CNS_Involvement", "1", "2",
-                 paste0("CNS_1_vs_2_in_", v))
-  run_comparison(sub_data, "Group_CNS_Involvement", "1", "3",
-                 paste0("CNS_1_vs_3_in_", v))
-  run_comparison(sub_data, "Group_CNS_Involvement", "2", "3",
-                 paste0("CNS_2_vs_3_in_", v))
-}
-
-for(dt in c("T-ALL", "B-ALL")){
-  run_comparison(data %>% filter(DiseaseType == dt),
-                 "Visitcode", "VR", "VD",
-                 paste0("Changes_VD_to_VR_in_", dt))
-}
-
-for(g in c("F", "M")){
-  run_comparison(data %>% filter(Gender == g),
-                 "Visitcode", "VR", "VD",
-                 paste0("Changes_VD_to_VR_in_", g))
-}
-
-for(cns in c("1", "2", "3")){
-  run_comparison(data %>% filter(Group_CNS_Involvement == cns),
-                 "Visitcode", "VR", "VD",
-                 paste0("Changes_VD_to_VR_in_CNS_", cns))
-}
-
-print("All comparisons completed successfully!")
-
 
 #***************************
 # AUTOMATIC PLOT GENERATION
 #***************************
 
-my_selected_proteins <- c("CD27", "CXCL9", "GZMA") 
+my_selected_proteins <- c("CD27", "CXCL9", "GZMA","FASLG","PLXNB3") 
 plot_summary_trajectory(data, my_selected_proteins, filename = "Summary_Trajectory_Custom.png")
-
 
 #***************************
 # Box plots with  asterisk
@@ -347,7 +364,7 @@ res_cns1 <- read_csv(file.path(DIR_TABLES, "Changes_VD_to_VR_in_CNS_1.csv"))
 res_cns2 <- read_csv(file.path(DIR_TABLES, "Changes_VD_to_VR_in_CNS_2.csv"))
 res_cns3 <- read_csv(file.path(DIR_TABLES, "Changes_VD_to_VR_in_CNS_3.csv"))
 
-# Helper for Significance Stars
+#  Helper for Significance Stars
 get_sig_label <- function(q) {
   if (is.na(q)) return("")
   if (q <= 0.001) return("***")
@@ -356,7 +373,7 @@ get_sig_label <- function(q) {
   return("ns")
 }
 
-# Plotting Function for Gender (F and M)
+#  Plotting Function for Gender (F and M) 
 plot_gender <- function(data, results, gender_val, proteins) {
   
   plot_data <- data %>%
@@ -391,7 +408,7 @@ plot_gender <- function(data, results, gender_val, proteins) {
   ggsave(paste0("Boxplot_Gender_", label_name, ".png"), p, width = 8, height = 6)
 }
 
-# Plotting Function for CNS Groups
+#  Plotting Function for CNS Groups 
 plot_cns <- function(data, results, level_num, proteins) {
   
   plot_data <- data %>%
@@ -418,32 +435,30 @@ plot_cns <- function(data, results, level_num, proteins) {
       panel.grid.major = element_blank(),
       panel.grid.minor = element_blank(),
       legend.position = "none")+
-    labs(y = "Protein abundance (NPX)") + 
+    labs(y = "Protein abundance (NPX)") +    # Set Y axis title
     geom_text(data = anno_data, aes(x = 1.5, y = Inf, label = label), 
               vjust = 1.5, inherit.aes = FALSE, size = 8)
   
-  ggsave(paste0("Boxplot_CNS_Group_", level_num, ".png"), p, width = 9, height = 8)
+  ggsave(paste0("Boxplot_CNS_Group_", level_num, ".png"), p, width = 9, height = 16)
 }
 
+#  Execution 
 
-# Gender plots for CD27 and CXCL9
-plot_gender(df_main, res_f, "F", c("CD27", "CXCL9"))
-plot_gender(df_main, res_m, "M", c("CD27", "CXCL9"))
+# Generate Gender plots
+plot_gender(data, res_f, "F", c("CD27", "CXCL9","FASLG","Gal_9"))
+plot_gender(data, res_m, "M", c("CD27", "CXCL9","FASLG","Gal_9"))
 
-# CNS plots for CXCL9, CXCL10, CXCL11, and GZMA
-cns_prots <- c("CXCL9", "CXCL10", "CXCL11", "GZMA")
-plot_cns(df_main, res_cns1, 1, cns_prots)
-plot_cns(df_main, res_cns2, 2, cns_prots)
-plot_cns(df_main, res_cns3, 3, cns_prots)
-
-
+# Generate CNS plots
+cns_prots <- c("CXCL9", "CD27", "FASLG", "CCL17", "CXCL11", "GZMA", "Gal_9", "CXCL10", "CD8A", "CTSC", "CCL3", "PLXNB3")
+plot_cns(data, res_cns1, 1, cns_prots)
+plot_cns(data, res_cns2, 2, cns_prots)
+plot_cns(data, res_cns3, 3, cns_prots)
 
 
 #=====================================================CNS 1 Vs CNS 2+3 in VD and in VR===============================================================
 
 
 #==========================================================CNS 1 Vs CNS 2+3 in VD===================================================================
-
 
 #***************************
 #      LOAD DATA
@@ -673,7 +688,6 @@ run_comparison(
 
 #==========================================================CNS 1 Vs CNS 2+3 in VR ===================================================================
 
-
 #***************************
 #      LOAD DATA
 #***************************
@@ -742,7 +756,6 @@ run_comparison <- function(df, group_col, g1, g2, label){
   })
   
   res <- bind_rows(res)
-  
   
 # Q-VALUE CALCULATION
   
@@ -900,4 +913,3 @@ run_comparison(
   g2 = "2+3", 
   label = "CNS_1_vs_2+3_in_VR"
 )_
-
